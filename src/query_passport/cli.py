@@ -129,7 +129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args == ["--help"]:
                 response["result"]["usage"] = (
                     "query-passport capabilities [--format json]; "
-                    "query-passport inspect|plan --request FILE|- "
+                    "query-passport inspect|plan|verify --request FILE|- "
                     "[--workspace DIR] [--format json]"
                 )
                 response["result"]["unimplemented_commands"] = list(FUTURE_COMMANDS)
@@ -148,7 +148,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if command == "capabilities"
                 else decode(read_request(options.request, options.workspace))
             )
+            if command == "verify":
+                signal.setitimer(signal.ITIMER_REAL, 60)
             response = respond(command, request)
+            if response["errors"]:
+                exit_code = ERRORS[response["errors"][0]["code"]][0]
     except ContractError as error:
         exit_code = ERRORS[error.code][0]
         response = envelope(command, "failed", {}, code=error.code)

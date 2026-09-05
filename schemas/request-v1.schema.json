@@ -28,6 +28,7 @@
     "environment": {
       "enum": [
         "local-synthetic",
+        "local",
         "protected"
       ]
     },
@@ -102,7 +103,8 @@
       "items": {
         "enum": [
           "profile.inspect.v1",
-          "plan.offline.v1"
+          "plan.offline.v1",
+          "connection.verify.v1"
         ]
       }
     }

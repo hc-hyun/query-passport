@@ -15,20 +15,31 @@ MAX_INPUT_BYTES = 65536
 MAX_OUTPUT_BYTES = 16384
 MAX_DEPTH = 8
 TIMEOUT_SECONDS = 5
-POLICY_REVISION = "m1-offline-1"
-COMMANDS = ("capabilities", "inspect", "plan")
-FUTURE_COMMANDS = ("verify", "issue", "apply", "deliver", "rotate", "rollback")
-CAPABILITIES = ("profile.inspect.v1", "plan.offline.v1")
+POLICY_REVISION = "m2-local-docker-1"
+COMMANDS = ("capabilities", "inspect", "plan", "verify")
+FUTURE_COMMANDS = ("issue", "apply", "deliver", "rotate", "rollback")
+CAPABILITIES = ("profile.inspect.v1", "plan.offline.v1", "connection.verify.v1")
 ERRORS = {
     "INVALID_INPUT": (2, "Input does not match the public request contract."),
     "UNSUPPORTED_OPERATION": (3, "The requested command or capability is not implemented."),
     "UNSUPPORTED_VERSION": (3, "The requested contract or profile version is not supported."),
     "INPUT_ACCESS_DENIED": (4, "Input must be a public regular JSON file inside the workspace."),
     "INPUT_TOO_LARGE": (2, "Input exceeds the request size limit."),
-    "TIMEOUT": (5, "The offline command exceeded its time limit."),
+    "TIMEOUT": (5, "The command exceeded its time limit."),
     "INTERNAL_ERROR": (1, "The offline command could not complete."),
     "OUTPUT_TOO_LARGE": (1, "The result exceeds the output size limit."),
     "INTERRUPTED": (130, "The offline command was interrupted."),
+    "AUTHORIZATION_REQUIRED": (6, "A valid operator-managed executor binding is required."),
+    "TARGET_MISMATCH": (7, "The request or observed target does not match the executor binding."),
+    "TARGET_DRIFT": (7, "The target changed during the operation."),
+    "EXECUTOR_FAILED": (8, "The executor did not return a valid bounded result."),
+    "CREDENTIAL_ACCESS_DENIED": (8, "Credential access or file permissions failed validation."),
+    "TLS_VERIFICATION_FAILED": (8, "Server TLS verification failed."),
+    "CLIENT_AUTHENTICATION_FAILED": (8, "Client certificate authentication failed."),
+    "PERMISSION_DENIED": (8, "The bound identity lacks the required diagnostic permissions."),
+    "CONNECTION_FAILED": (8, "The bound database connection could not be established."),
+    "VERIFICATION_FAILED": (8, "The requested live verification did not pass."),
+    "RECOVERY_REQUIRED": (9, "An owned diagnostic resource needs executor cleanup."),
 }
 
 
@@ -72,7 +83,7 @@ def validate(request: Any) -> dict[str, Any]:
     if request["contract_version"] != "1" or request["profile_version"] != 1:
         raise ContractError("UNSUPPORTED_VERSION")
     require(request["scope"] == "database-only")
-    require(request["environment"] in ("local-synthetic", "protected"))
+    require(request["environment"] in ("local-synthetic", "local", "protected"))
     for field in ("deployment_alias", "target_alias"):
         require(matches(request[field], r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", 63))
     count = request["source_count"]
@@ -98,7 +109,7 @@ def validate(request: Any) -> dict[str, Any]:
     return dict(request)
 
 
-def decode(raw: bytes) -> dict[str, Any]:
+def parse_json(raw: bytes) -> Any:
     if len(raw) > MAX_INPUT_BYTES:
         raise ContractError("INPUT_TOO_LARGE")
 
@@ -122,9 +133,13 @@ def decode(raw: bytes) -> dict[str, Any]:
                 stack.extend((value, depth + 1) for value in item.values())
             elif isinstance(item, list):
                 stack.extend((value, depth + 1) for value in item)
-        return validate(parsed)
+        return parsed
     except (ValueError, RecursionError) as error:
         raise ContractError() from error
+
+
+def decode(raw: bytes) -> dict[str, Any]:
+    return validate(parse_json(raw))
 
 
 def envelope(
@@ -146,6 +161,10 @@ def envelope(
 
 
 def respond(command: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
+    if command == "verify":
+        from .executor import verify_request
+
+        return verify_request(validate(request))
     if command == "capabilities":
         return envelope(
             command,
@@ -154,17 +173,19 @@ def respond(command: str, request: dict[str, Any] | None = None) -> dict[str, An
                 "supported_contract_majors": [1],
                 "capabilities": list(CAPABILITIES),
                 "commands": list(COMMANDS),
-                "backend_types": ["offline"],
+                "backend_types": ["offline", "local-docker"],
                 "policy_revision": POLICY_REVISION,
                 "profile_versions": [1],
                 "source_reference_version": 6,
                 "scopes": ["database-only"],
-                "environments": ["local-synthetic", "protected"],
+                "environments": ["local-synthetic", "local", "protected"],
+                "live_environments": ["local-synthetic", "local"],
                 "limits": {
                     "input_bytes": MAX_INPUT_BYTES,
                     "output_bytes": MAX_OUTPUT_BYTES,
                     "json_depth": MAX_DEPTH,
                     "timeout_seconds": TIMEOUT_SECONDS,
+                    "live_timeout_seconds": 60,
                 },
             },
         )

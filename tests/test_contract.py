@@ -92,7 +92,7 @@ def test_required_fields(request_data, field):
         (("profile", "database"), "a" * 64),
         (("profile", "sslmode"), "require"),
         (("profile", "authentication", "type"), "password"),
-        (("required_capabilities",), ["connection.verify.v1"]),
+        (("required_capabilities",), ["certificate.issue.v1"]),
         (("required_capabilities",), ["plan.offline.v1", "plan.offline.v1"]),
         (("required_capabilities",), [None]),
     ],
@@ -149,9 +149,13 @@ def test_digest_binds_request_and_is_stable(request_data):
 
 def test_capabilities_are_only_implemented():
     result = respond("capabilities")["result"]
-    assert result["commands"] == ["capabilities", "inspect", "plan"]
-    assert result["capabilities"] == ["profile.inspect.v1", "plan.offline.v1"]
-    assert result["backend_types"] == ["offline"]
+    assert result["commands"] == ["capabilities", "inspect", "plan", "verify"]
+    assert result["capabilities"] == [
+        "profile.inspect.v1",
+        "plan.offline.v1",
+        "connection.verify.v1",
+    ]
+    assert result["backend_types"] == ["offline", "local-docker"]
 
 
 @pytest.mark.parametrize("path", [("profile",), ("profile", "authentication")])
@@ -168,7 +172,11 @@ def test_nested_required_fields(request_data, path):
 
 def test_supported_capabilities_and_protected_context(request_data):
     request_data["environment"] = "protected"
-    request_data["required_capabilities"] = ["profile.inspect.v1", "plan.offline.v1"]
+    request_data["required_capabilities"] = [
+        "profile.inspect.v1",
+        "plan.offline.v1",
+        "connection.verify.v1",
+    ]
     jsonschema.validate(request_data, SCHEMA)
     result = respond("plan", request_data)["result"]
     assert result["executable"] is False

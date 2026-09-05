@@ -8,14 +8,15 @@ Query Passport는 Query Man이 PostgreSQL에 접속할 때 필요한 인증서�
 
 ## 현재 상태와 다음 시작점
 
-현재는 **M1 오프라인 CLI 구현 완료** 상태다. Python 3.12+와 uv로 설치하며 `capabilities`,
-`inspect`, `plan`을 JSON으로 호출할 수 있다. 런타임 외부 package 의존성은 없다.
-실제 DB 연결·인증서 검증, PKI 연동, Kubernetes, 자동 갱신, Query Man 스킬 연계와 CI는 미구현이다.
+현재는 **M1 오프라인 CLI와 M2 로컬 Docker 접속 검증 구현** 상태다. Python 3.12+와 uv로 설치하며 `capabilities`,
+`inspect`, `plan`, `verify`를 JSON으로 호출할 수 있다. 런타임 외부 package 의존성은 없다.
+승인된 로컬 binding을 통한 실제 DB/TLS·인증서 검증을 지원한다. 발급·적용·전달·복구,
+Kubernetes, 자동 갱신과 CI는 미구현이며 Query Man 스킬 연계는 별도 변경으로 검증한다.
 원격 저장소는 [hc-hyun/query-passport](https://github.com/hc-hyun/query-passport)다.
-M2 이후 문서의 명령과 흐름은 개발 목표다.
+M3 이후 문서의 명령과 흐름은 개발 목표다.
 
 이 폴더에서 이어서 작업할 때는 [AGENTS.md](AGENTS.md)와
-[개발 계획의 첫 작업](docs/development-plan.md#바로-이어서-할-첫-작업)을 읽고 M2부터 시작한다.
+[개발 계획의 첫 작업](docs/development-plan.md#바로-이어서-할-첫-작업)을 읽고 M3부터 시작한다.
 기존 호스트 작업물이나 DB를 먼저 옮기거나 수정할 필요는 없다.
 
 ## 설치와 실행
@@ -32,6 +33,9 @@ uv run --locked query-passport plan --request examples/request.json --format jso
 uv run --locked query-passport plan --request - < examples/request.json
 uv run --locked query-passport --version
 ```
+
+live 검사 준비와 결과 해석은 [로컬 Docker executor](docs/local-executor.md)를 따른다.
+유효한 operator binding이 없으면 `verify`는 접속 전에 `AUTHORIZATION_REQUIRED`로 거절한다.
 
 독립 CLI 설치는 `uv tool install .`로 가능하다. 이후 `query-passport --help`도 JSON으로 반환한다.
 입력 파일 경로는 `--workspace DIR`(기본 현재 디렉터리) 기준 상대 경로다.
@@ -93,8 +97,8 @@ Query Passport가 중단되어도 이미 준비된 인증서로 수행하는 Que
 
 ## 주요 산출물
 
-M1의 package·CLI·공개 입력 계약·오프라인 테스트·사용 예시는 구현했다.
-아래 표에서 실제 DB·PKI·배포·복구와 스킬 연계는 후속 개발 대상이다.
+M1의 package·CLI·공개 입력 계약과 M2의 로컬 Docker 접속 검증·실제 인증 거부 테스트를 구현했다.
+아래 표에서 PKI·배포·복구는 후속 개발 대상이다.
 
 | 산출물 | 필요한 결과 |
 |---|---|

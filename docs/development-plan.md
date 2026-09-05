@@ -1,9 +1,10 @@
 # 개발 계획
 
-Status: M1 구현 완료 / M2–M5 미구현
+Status: M1 완료 / M2 로컬 verify 검증 완료·스킬 연계 검증 중 / M3–M5 진행 대상
 
-M1의 Python + uv package, `capabilities`·`inspect`·`plan`, JSON 입출력과 오프라인 검증을 구현했다.
-M1 지원 계약은 [Tool contract](tool-contract.md)에 고정했고 M2 이후는 설계안이다.
+M1의 Python + uv package·오프라인 계약과 M2의 로컬 Docker `verify`를 구현했다.
+M1·M2 지원 계약은 [Tool contract](tool-contract.md)와 [로컬 executor](local-executor.md)에 있으며
+M3 이후는 설계안이다.
 실제 작업 경계는 [운영 설계](operations.md)가 소유한다.
 문서를 작성했다는 이유로 외부 DB나 Kubernetes 실행이 승인되지는 않는다.
 
@@ -22,13 +23,13 @@ M2부터 스킬 연계를 작게 검증한다. 모든 Kubernetes 기능이 생�
 
 ## 바로 이어서 할 첫 작업
 
-1. M2를 시작할 때 승인된 disposable 대상·executor alias binding·읽기 전용 검증 범위를 고정한다.
-2. 승인된 target과 endpoint·DB·환경·route가 일치하는지 실행 전에 확인하는 경계를 구현한다.
-3. live `verify`에서 TLS·identity·인증서 거부·timeout·연결 복구를 검증한다.
-4. Query Man 저장소의 지침에 따라 스킬의 capability 확인과 결과 해석을 별도 작업으로 연계한다.
+1. M2의 Query Man 스킬 consumer 연결을 별도 저장소의 지침대로 검증·커밋한다.
+2. M3에서 새 disposable 대상의 PKI 발급·소유한 HBA/ident 적용·credential 전달을 연결한다.
+3. 적용 전 snapshot/CAS·lock·NOLOGIN 순서·실패/재개/소유 범위 복구를 실제 PostgreSQL로 검증한다.
+4. 위 경로가 통과한 뒤 기존 voc-db의 승인된 상태와 전환·보존 범위를 구체화한다.
 
-M1에서 실제 환경은 접근하지 않았다. M2의 대상과 권한은 오프라인 요청의 alias나 digest로
-증명되지 않는다. M1 계획을 실행 가능한 snapshot 또는 승인 artifact로 재사용하지 않는다.
+기존 DB/credential/백업/기록은 보존한다. M1 계획은 여전히 executable false이며 live snapshot이나
+실행 승인 artifact로 재사용하지 않는다. M2 검사 성공도 기존 도구·credential 폐기 근거가 아니다.
 
 ## 단계별 상세 범위
 
@@ -160,3 +161,12 @@ M2부터 bounded integration, M3부터 failure/recovery, M4부터 container/Pod 
 
 미정인 운영 환경 항목은 M1 개발을 막지 않는다. 뒤 단계의 미정 입력을 로컬 값으로 채워 운영 지원을
 주장하지 않는다.
+
+## M2 로컬 검증 기록
+
+0.2.0의 M2 관련 unit/process 검사 335개, lint·format·mypy를 통과했다.
+새 PostgreSQL 18 fixture에서 정상 TLS·인증서 거부·source 0개·timeout/cancel/rollback/reconnect와
+대상 drift를 실제로 검증했으며 설치된 wheel의 subprocess 성공/거부 경로를 포함한
+integration 23개를 통과했다.
+정확한 실행 명령은 [로컬 executor 검증](local-executor.md#disposable-검증)에 있다.
+기존 voc-db나 기존 인증서에는 접근·변경하지 않았고 아직 사용 전환 완료를 주장하지 않는다.

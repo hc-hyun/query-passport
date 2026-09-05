@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "query-passport"
-version = "0.1.0"
-description = "Offline input inspection and planning for Query Man"
+version = "0.2.0"
+description = "Certificate and database connection preparation for Query Man"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
@@ -14,7 +14,14 @@ dependencies = []
 query-passport = "query_passport.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8,<10", "ruff>=0.11,<1", "mypy>=1.15,<2", "jsonschema>=4.23,<5"]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.11,<1",
+    "mypy>=1.15,<2",
+    "jsonschema>=4.23,<5",
+    "cryptography>=44,<47",
+    "psycopg[binary]>=3.2,<4",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

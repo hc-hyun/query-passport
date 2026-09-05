@@ -1,6 +1,6 @@
 # 운영 설계
 
-이 문서는 Query Passport의 운영 구현 목표다. 현재 M1 오프라인 CLI만 있으며 live 실행 도구나 Kubernetes 배포는 없고,
+이 문서는 Query Passport의 운영 구현 목표다. 현재 M1 오프라인 CLI와 M2 로컬 Docker 읽기 전용 검증이 있으며 쓰기 기능과 Kubernetes 배포는 없고,
 이 문서 작성은 기존 DB·PKI·Secret 변경의 실행 승인이 아니다. 명령과 결과 형식은
 [Tool contract](tool-contract.md), 기존 작업의 위치와 한계는 [로컬 인계](local-handoff.md)를 따른다.
 

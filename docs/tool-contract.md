@@ -1,7 +1,8 @@
 # Query Man 스킬과 Query Passport의 호출 계약
 
-이 문서는 **M1 구현 계약과 M2 이후 설계안**을 구분한다. `query-passport` 0.1.0은
-계약 major 1의 `capabilities`, `inspect`, `plan`을 구현했다. live 검증·변경·승인·복구는 미구현이다.
+이 문서는 **M1·M2 구현 계약과 M3 이후 설계안**을 구분한다. `query-passport` 0.2.0은
+계약 major 1의 `capabilities`, `inspect`, `plan`, 로컬 Docker `verify`를 구현했다.
+발급·변경·전달·복구와 protected 승인 backend는 아직 미구현이다.
 현재 Query Man의 profile, 인증 단위, credential layout과 운영 승인을 변경하는 문서가 아니다.
 
 ## 1. 누가 무엇을 담당하는가
@@ -88,7 +89,7 @@ query-passport inspect --request request.json --format json
 query-passport plan --request request.json --format json
 ```
 
-승인된 실행 context가 준비된 다음 단계의 **미구현 예시**는
+유효한 로컬 operator binding이 준비된 실행 예시는
 `query-passport verify --request request.json --format json`이다. CLI 플래그로 승인을 만들어 내지 않는다.
 
 응답 envelope에는 `contract_version`, `tool_version`, `command`, `status`, `scope`, `result`, `errors`를 둔다.
@@ -133,8 +134,8 @@ profile YAML/source v6 validator를 대체하지 않는다. `profile_validation:
   미지 필드를 거절한다. `profile_version: 1`은 요청 envelope에 추가한 참조 버전이며 profile 원본의 변경이 아니다.
 - `contract_version`은 문자열 `"1"`, `profile_version`은 정수 `1`이다. JSON의 실수 표기(`1.0`)와
   boolean은 정수 필드에서 거절한다(JSON Schema의 수학적 integer 판정보다 엄격한 wire 규칙).
-- `scope`는 `database-only`, `environment`는 `local-synthetic` 또는 `protected`만 받는다.
-  환경 값과 alias의 구문 검사는 실제 대상 확인·allowlist binding·승인 검증이 아니다. 그런 backend는 M1에 없다.
+- `scope`는 `database-only`, `environment`는 `local-synthetic`, `local`, `protected`만 받는다.
+  환경 값과 alias의 구문 검사는 실제 대상 확인·allowlist binding·승인 검증이 아니다. `verify`만 별도 operator binding과 live 대상을 확인한다. [로컬 executor](local-executor.md)를 따른다.
 - profile ID와 두 alias는 영문 소문자로 시작하는 소문자·숫자·단일 하이픈 구분 이름, 최대 63자다.
   database는 영문 또는 `_`로 시작하는 영문·숫자·`_`, 최대 63자이며 대소문자를 그대로 보존한다.
   이 제한은 M1 공개 projection의 지원 부분집합이며 기존 Query Man/PostgreSQL의 이름 규칙을 재정의하지 않는다.
@@ -143,7 +144,7 @@ profile YAML/source v6 validator를 대체하지 않는다. `profile_validation:
 - port는 정수 1–65535, `source_count`는 정수 0–1000000이다. 양수도 caller 문맥으로만 보존하며
   reader 검사를 추가하지 않는다. TLS는 `verify-full`, 인증은 `client-certificate`만 허용한다.
 - 선택적 `required_capabilities`는 중복 없는 최대 16개 기능 ID 배열이다. M1은
-  `profile.inspect.v1`, `plan.offline.v1`만 지원한다. 미지원 기능 요구는 `UNSUPPORTED_OPERATION`이다.
+  `profile.inspect.v1`, `plan.offline.v1`, `connection.verify.v1`을 지원한다. 미지원 기능 요구는 `UNSUPPORTED_OPERATION`이다.
 - JSON은 UTF-8, 최대 65,536 bytes, 최대 깊이 8(root 깊이 1)이다. 중복 key, NaN/Infinity,
   여러 JSON 문서, 잘못된 UTF-8은 거절한다. stdout은 개행을 포함해 최대 16,384 bytes인 JSON 하나다.
 - `--request FILE`은 `--workspace DIR`(기본 현재 디렉터리) 안의 상대 `.json` 일반 파일이다.
@@ -222,7 +223,7 @@ driver 오류, 연결 문자열, SQL literal, host 파일 경로, Secret 식별�
 ```json
 {
   "contract_version": "1",
-  "tool_version": "0.1.0",
+  "tool_version": "0.2.0",
   "command": "plan",
   "status": "planned",
   "scope": "database-only",
@@ -243,7 +244,7 @@ driver 오류, 연결 문자열, SQL literal, host 파일 경로, Secret 식별�
     "source_admission": "not_checked",
     "application_readiness": "not_checked",
     "input_digest": "sha256:40c2720bcd45e015b21194cd5fc3c679836fa5651a0e9d2c34872966778865cb",
-    "policy_revision": "m1-offline-1",
+    "policy_revision": "m2-local-docker-1",
     "executable": false,
     "target_snapshot": "unknown",
     "differences": "unknown",
@@ -274,7 +275,7 @@ driver 오류, 연결 문자열, SQL literal, host 파일 경로, Secret 식별�
       "target_mismatch"
     ],
     "recovery": "no_changes_performed",
-    "plan_digest": "sha256:ff9c5095655080bcf0918a338fb8a5965f30773644b5d753096495dff56d6564"
+    "plan_digest": "sha256:ee54fcc19598280d0ad2d2e1e1b33cf7fa467b3a35f39f8e39d4b5be4c37f9bd"
   },
   "errors": []
 }
@@ -282,7 +283,8 @@ driver 오류, 연결 문자열, SQL literal, host 파일 경로, Secret 식별�
 
 `status` 제안은 `validated`, `planned`, `succeeded`, `blocked`, `failed`, `partial_failure`, `unknown`이다.
 `succeeded`는 요청된 scope의 검증 완료만 뜻한다. 검사 항목은 `passed`·`failed`·`not_checked`를 별도 표시한다.
-M1의 정상 종료 코드는 0이며 실패 코드는 4절의 표로 고정한다. M1은 `validated`, `planned`, `failed`만 반환한다.
+정상 종료 코드는 0이며 오프라인은 `validated`·`planned`, live 검증 완료는 `succeeded`다.
+실패는 `failed`와 비영 종료를 반환한다. 종료 코드 6–9 및 live 결과는 [로컬 executor 계약](local-executor.md)에 있다.
 스킬은 종료 코드뿐 아니라 JSON schema·status·검사 항목을 확인하며 알 수 없는 응답은 성공으로 보고하지 않는다.
 
 오류 예시는 `INVALID_INPUT`, `UNSUPPORTED_OPERATION`, `AUTHORIZATION_REQUIRED`, `TARGET_DRIFT`,
@@ -307,7 +309,7 @@ timeout·연결 단절로 외부 작업 완료 여부가 불명확하면 `unknow
 
 M1은 네트워크 없이 위 입력을 `inspect → plan`으로 처리한다. schema·capabilities·safe JSON,
 잘못된 입력·비밀 필드 비노출·source 0개의 의미를 root `tests/`에서 검증했다. live 성공을 주장하지 않는다.
-다음 작업은 별도 승인된 local synthetic alias로 실제 `verify`를 추가한다. 성공·인증서 거부·timeout·rollback
+M2의 실제 `verify`는 별도 승인된 local alias와 disposable fixture로 검증한다. 성공·인증서 거부·timeout·rollback
 결과를 정규화하고, target mismatch와 미승인 접속이 실행 전에 거절됨을 검증한다.
 로컬 스크립트를 감싸 raw 출력만 넘기는 구현은 이 계약을 만족하지 않는다.
 

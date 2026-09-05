@@ -41,7 +41,7 @@ def run(*args, data=None, cwd=ROOT):
         "errors",
     }
     assert response["contract_version"] == "1"
-    assert response["tool_version"] == "0.1.0"
+    assert response["tool_version"] == "0.2.0"
     assert MARKER.encode() not in completed.stdout
     return completed.returncode, response
 
@@ -62,7 +62,7 @@ def test_discovery(args):
 
 
 @pytest.mark.parametrize(
-    "command", ["verify", "issue", "apply", "deliver", "rotate", "rollback", MARKER, "psql"]
+    "command", ["issue", "apply", "deliver", "rotate", "rollback", MARKER, "psql"]
 )
 def test_unsupported_does_not_read_request(command):
     code, response = run(command, "--request", MARKER)
@@ -215,7 +215,7 @@ def test_unexpected_exception_is_redacted(monkeypatch, capfd):
 
 
 def test_output_limit(monkeypatch, capfd):
-    monkeypatch.setattr(cli, "respond", lambda *args: {"large": "x" * 16384})
+    monkeypatch.setattr(cli, "respond", lambda *args: {"large": "x" * 16384, "errors": []})
     assert cli.main(["capabilities"]) == 1
     assert json.loads(capfd.readouterr().out)["errors"][0]["code"] == "OUTPUT_TOO_LARGE"
 
