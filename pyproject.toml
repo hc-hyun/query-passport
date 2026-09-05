@@ -8,7 +8,9 @@ version = "0.2.0"
 description = "Certificate and database connection preparation for Query Man"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "cryptography>=44,<47",
+]
 
 [project.scripts]
 query-passport = "query_passport.cli:main"
@@ -19,7 +21,6 @@ dev = [
     "ruff>=0.11,<1",
     "mypy>=1.15,<2",
     "jsonschema>=4.23,<5",
-    "cryptography>=44,<47",
     "psycopg[binary]>=3.2,<4",
 ]
 

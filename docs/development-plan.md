@@ -1,6 +1,6 @@
 # 개발 계획
 
-Status: M1 완료 / M2 로컬 verify 검증 완료·스킬 연계 검증 중 / M3–M5 진행 대상
+Status: M1·M2 완료 / M3 구현 중 / M4–M5 미구현
 
 M1의 Python + uv package·오프라인 계약과 M2의 로컬 Docker `verify`를 구현했다.
 M1·M2 지원 계약은 [Tool contract](tool-contract.md)와 [로컬 executor](local-executor.md)에 있으며
@@ -13,7 +13,7 @@ M3 이후는 설계안이다.
 | 단계 | 목표 | 구현할 산출물 | 완료 기준 |
 |---|---|---|---|
 | M1 (완료) | 오프라인 계획을 스킬이 읽을 수 있게 만들기 | 단일 CLI/package, 요청 검증, version/capabilities, `plan` JSON, 사용 예시 | DB·Docker·PKI·Secret 접근 없이 정상/오류 결과를 예측 가능하게 반환 |
-| M2 | 승인된 대상의 실제 연결 검증 | Docker 대상 확인, profile별 credential 전달 검증, live `verify`, 스킬의 최소 연계 | 정확한 대상에서 긍정/부정 접속 검사와 스킬 결과 해석이 재현됨 |
+| M2 (완료) | 승인된 대상의 실제 연결 검증 | Docker 대상 확인, profile별 credential 전달 검증, live `verify`, 스킬의 최소 연계 | 정확한 대상에서 긍정/부정 접속 검사와 스킬 결과 해석이 재현됨 |
 | M3 | 로컬 테스트 환경의 인증 준비 자동화 | 테스트 PKI 발급, 제한된 DB 인증 적용, 외부 상태 관리, 실패·재개·복구, DBA 스킬의 해당 호출 | 새 disposable DB에서 준비→검증→실패복구를 수행하고 기존 설정을 보존 |
 | M4 | Pod에 credential을 공급하기 | 선택한 Secret provider 경로, manifest template, Pod UID/권한·DNS 검증, 별도 검증 Job | Pod 재생성·다른 node 배치 후에도 승인된 서비스 identity로 접속 |
 | M5 | 갱신과 운영 인계 마무리 | rotation/폐기/복구 흐름, 만료 관리, consumer 호환 테스트, 운영 PKI·기록 체계 연계 | 새 인증서 전환과 장애 복구, 기록 보존, 전체 스킬 호출 계약을 환경별로 검증 |
@@ -23,7 +23,7 @@ M2부터 스킬 연계를 작게 검증한다. 모든 Kubernetes 기능이 생�
 
 ## 바로 이어서 할 첫 작업
 
-1. M2의 Query Man 스킬 consumer 연결을 별도 저장소의 지침대로 검증·커밋한다.
+1. M2의 실제 검사 경로를 유지하며 M3 lifecycle executor를 구현한다.
 2. M3에서 새 disposable 대상의 PKI 발급·소유한 HBA/ident 적용·credential 전달을 연결한다.
 3. 적용 전 snapshot/CAS·lock·NOLOGIN 순서·실패/재개/소유 범위 복구를 실제 PostgreSQL로 검증한다.
 4. 위 경로가 통과한 뒤 기존 voc-db의 승인된 상태와 전환·보존 범위를 구체화한다.
@@ -117,7 +117,8 @@ M3 완료는 “한 번 성공”이 아니라 실패 지점별로 기존 서비
 ## 검증 책임과 완료 보고
 
 M1 최소 환경은 Linux/POSIX, Python 3.12+, uv이며 현재 Python 3.12.3에서 검증했다.
-런타임은 표준 라이브러리만 사용한다. `uv.lock`으로 개발 검사 의존성을 고정한다.
+M1 구현 당시 런타임은 표준 라이브러리만 사용했다. M3 내부 발급 모듈부터 `cryptography`를
+런타임 의존성으로 추가했으며 `uv.lock`으로 실행·개발 의존성을 고정한다.
 
 ```bash
 uv sync --locked
@@ -141,8 +142,8 @@ M1 사용 점검 후 workspace 경로 전체의 symlink 거절과 닫힌 stdout�
 테스트는 root `tests/`에 있으며 schema·필수값·이름·port·version·금지 필드·source 0개,
 미지원 명령/capability, JSON 크기·중첩·중복 key·UTF-8, symlink/hardlink/FIFO·workspace 경계,
 입력값·예외 비노출, 네트워크·credential 미접근, stdin timeout과 출력 제한을 검증한다.
-전체 Query Man YAML/source validator는 실행하지 않는다. 실제 인증서 거부·target drift·일부 적용
-실패·복구는 아직 구현하지 않은 M2/M3의 검증이며 M1 통과로 대신하지 않는다. CI는 미구현이다.
+전체 Query Man YAML/source validator는 실행하지 않는다. 실제 인증서 거부·target drift는 아래 M2 기록으로 별도 검증했다. 일부 적용 실패·설정 복구의
+전체 lifecycle은 M3의 남은 검증이며 M1/M2 통과로 대신하지 않는다. CI는 미구현이다.
 M2부터 bounded integration, M3부터 failure/recovery, M4부터 container/Pod 검증을 추가한다.
 
 구현 결과는 지원 capability, 아직 없는 기능, exact code/artifact revision, 수행한 검사와 실제 외부
@@ -177,3 +178,16 @@ HBA/ident의 소유 block만 생성·비교·복구하는 순수 helper를 구�
 기존 block 교체에는 원문 digest 일치가 필요하며, 복구는 다른 작업의 변경을 보존한다.
 이 helper만으로 DB 파일 쓰기·reload·NOLOGIN·PKI 발급·전달·실패복구를 완료했다고 판단하지 않는다.
 실제 lifecycle executor와 disposable E2E는 다음 구현 대상이다.
+
+M2 완료 provenance: Passport `4d5d8db`, Query Man consumer `8d7e93b`. Passport unit/process 및
+실제 Docker integration을 한 번에 실행해 358개 통과. Query Man 전체 gate는 Ruff·Mypy 및
+pytest 575개 통과(11 deselected). Admin의 실제 offline plan과 DBA helper → Passport → 새 DB의
+실제 TLS/인증/cancel/rollback/reconnect 성공을 확인했다. 기존 application readiness는 not_checked다.
+
+로컬 테스트 issuer는 CA와 발급 세대를 분리하고 기존 파일을 덮어쓰지 않는다. 같은 요청의 재사용,
+불완전 발급 보존, 권한·symlink·Git 경계, 실제 인증서와 키 검증을 61개 테스트로 확인했다.
+외부 상태 저장소는 operation/target lock, 배타적 artifact 생성, append+fsync 기록과 부분 쓰기
+보존을 25개 테스트로 확인했다. 이 로컬 기록은 protected immutable evidence가 아니다.
+Docker/issuer의 private stdin은 1 MiB로 제한하고 입출력을 동시에 처리해 쓰기 중 timeout도
+강제한다. 관련 process·binding·PKI·state 검사 126개와 Ruff·Mypy를 통과했다.
+아직 내부 모듈 검증이며, 공개 쓰기 명령이나 DB 적용·전달·복구 E2E 완료를 뜻하지 않는다.

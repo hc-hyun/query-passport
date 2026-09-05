@@ -9,15 +9,14 @@ import ipaddress
 import json
 import os
 import pwd
-import select
 import stat
-import subprocess
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from .contract import ContractError, envelope, matches, object_fields, parse_json, require, validate
+from .process import run_process
 
 DOCKER = "/usr/bin/docker"
 DOCKER_ARGS = [DOCKER, "--host", "unix:///var/run/docker.sock"]
@@ -39,57 +38,21 @@ def docker(
     worker_output: bool = False,
 ) -> bytes:
     """Run one fixed executor operation with bounded output, time and no raw stderr."""
-    if stdin is not None and len(stdin) > 8192:
+    code, output = run_process(
+        DOCKER_ARGS + args, env=PROCESS_ENV, stdin=stdin, timeout=timeout, limit=limit
+    )
+    if worker_output and code in (0, 1):
+        try:
+            result = parse_json(output)
+        except ContractError as error:
+            raise ContractError("EXECUTOR_FAILED") from error
+        if type(result) is not dict or result.get("status") != (
+            "succeeded" if code == 0 else "failed"
+        ):
+            raise ContractError("EXECUTOR_FAILED")
+    elif code != 0:
         raise ContractError("EXECUTOR_FAILED")
-    try:
-        with subprocess.Popen(
-            DOCKER_ARGS + args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=PROCESS_ENV,
-        ) as process:
-            assert process.stdin is not None and process.stdout is not None
-            try:
-                if stdin:
-                    process.stdin.write(stdin)
-                process.stdin.close()
-                deadline = time.monotonic() + timeout
-                output = bytearray()
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise ContractError("TIMEOUT")
-                    readable, _, _ = select.select([process.stdout], [], [], remaining)
-                    if not readable:
-                        raise ContractError("TIMEOUT")
-                    chunk = os.read(process.stdout.fileno(), min(4096, limit + 1 - len(output)))
-                    if not chunk:
-                        break
-                    output.extend(chunk)
-                    if len(output) > limit:
-                        raise ContractError("EXECUTOR_FAILED")
-                code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
-                if worker_output and code in (0, 1):
-                    try:
-                        result = parse_json(bytes(output))
-                    except ContractError as error:
-                        raise ContractError("EXECUTOR_FAILED") from error
-                    if type(result) is not dict or result.get("status") != (
-                        "succeeded" if code == 0 else "failed"
-                    ):
-                        raise ContractError("EXECUTOR_FAILED")
-                elif code != 0:
-                    raise ContractError("EXECUTOR_FAILED")
-                return bytes(output)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                process.wait()
-    except subprocess.TimeoutExpired as error:
-        raise ContractError("TIMEOUT") from error
-    except (OSError, subprocess.SubprocessError) as error:
-        raise ContractError("EXECUTOR_FAILED") from error
+    return output
 
 
 def binding_directory() -> Path:

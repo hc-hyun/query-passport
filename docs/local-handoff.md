@@ -20,7 +20,8 @@
 스킬은 [Admin](../../query-boy/.agents/skills/query-man-admin/SKILL.md)과
 [DBA onboarding](../../query-boy/.agents/skills/query-man-dba-onboarding/SKILL.md)을 읽는다.
 이 인계 문서 작성 시점에는 설치 가능한 `query-passport` tool과 그 호출이 없었다.
-현재는 M1 오프라인 CLI를 구현했으며 Query Man 스킬 연계는 아직 없다.
+현재는 M1 오프라인 CLI와 M2 로컬 접속 검증·Query Man 스킬 연계를 구현했다.
+이 문서의 기존 호스트 작업물과 실제 voc-db 사용 전환은 아직 수행하지 않았다.
 
 ## 로컬 DB 상태
 
