@@ -13,7 +13,8 @@ Query Passport는 Query Man이 PostgreSQL에 접속할 때 필요한 인증서�
 승인된 로컬 binding을 통한 실제 DB/TLS·인증서 검증을 지원한다. 발급·적용·전달·복구,
 Kubernetes, 자동 갱신과 CI는 미구현이다. Query Man 스킬 consumer 연계는 별도 저장소에서 검증했다.
 원격 저장소는 [hc-hyun/query-passport](https://github.com/hc-hyun/query-passport)다.
-M3의 내부 발급·설정 보존·실행 기록 모듈은 구현 중이며, 공개 쓰기 명령과 전체 적용·복구 흐름은 아직 개발 목표다.
+M3의 내부 발급·설정 적용·전달·복구 경로를 새 disposable DB에서 검증했다.
+공개 쓰기 CLI와 rotation·기존 DB 전환은 남아 있으며 [로컬 lifecycle](docs/local-lifecycle.md)에 경계를 정리했다.
 
 이 폴더에서 이어서 작업할 때는 [AGENTS.md](AGENTS.md)와
 [개발 계획의 첫 작업](docs/development-plan.md#바로-이어서-할-첫-작업)을 읽고 M3부터 시작한다.

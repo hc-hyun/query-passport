@@ -84,7 +84,7 @@ def private_directory(path: str, *, runtime_owner: bool = False) -> int:
         raise
 
 
-def load_binding(request: dict[str, Any]) -> dict[str, Any]:
+def load_binding(request: dict[str, Any], *, operation: str = "verify") -> dict[str, Any]:
     request = validate(request)
     directory = descriptor = -1
     try:
@@ -113,7 +113,14 @@ def load_binding(request: dict[str, Any]) -> dict[str, Any]:
             binding = parse_json(raw)
         except ContractError as error:
             raise ContractError("AUTHORIZATION_REQUIRED") from error
-        validate_binding(binding, request)
+        if type(binding) is dict and binding.get("binding_version") == 2:
+            from .lifecycle_binding import validate_lifecycle_binding
+
+            validate_lifecycle_binding(binding, request, operation)
+        else:
+            if operation != "verify":
+                raise ContractError("AUTHORIZATION_REQUIRED")
+            validate_binding(binding, request)
         return dict(binding)
     except (OSError, ValueError, RecursionError) as error:
         raise ContractError("AUTHORIZATION_REQUIRED") from error
@@ -367,7 +374,29 @@ def verify_request(request: dict[str, Any]) -> dict[str, Any]:
     from .contract import respond
 
     request = validate(request)
-    worker = run_verification(load_binding(request), request)
+    binding = load_binding(request)
+    if binding["binding_version"] == 2:
+        from . import credential_delivery, operation_store
+        from .lifecycle_binding import verification_projection
+
+        # A v2 binding names the private delivery store. Resolve its current
+        # immutable bundle under the same target lock used by lifecycle changes.
+        try:
+            with operation_store.target_lock(binding["container_id"]):
+                destination = Path(binding["credential_dir"])
+                active = credential_delivery.inspect_delivery(destination)
+                if active["generation_id"] is None:
+                    raise ContractError("CREDENTIAL_ACCESS_DENIED")
+                directory = destination / "versions" / active["generation_id"] / "bundle"
+                worker = run_verification(verification_projection(binding, str(directory)), request)
+                if credential_delivery.inspect_delivery(destination) != active:
+                    raise ContractError("TARGET_DRIFT")
+        except credential_delivery.DeliveryError as error:
+            raise ContractError("CREDENTIAL_ACCESS_DENIED") from error
+        except operation_store.StateError as error:
+            raise ContractError("RECOVERY_REQUIRED") from error
+    else:
+        worker = run_verification(binding, request)
     result = respond("inspect", request)["result"]
     checks = worker["checks"]
     result.update(

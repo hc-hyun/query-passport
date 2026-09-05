@@ -33,6 +33,7 @@ ARTIFACTS = frozenset(
         "trust.previous.crt",
         "issuance.json",
         "delivery.json",
+        "db.applied.json",
     }
 )
 PHASES = frozenset(
@@ -43,6 +44,7 @@ PHASES = frozenset(
         "applying",
         "applied",
         "delivering",
+        "checking_delivery",
         "delivered",
         "verifying",
         "verified",

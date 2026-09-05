@@ -26,9 +26,9 @@ ERRORS = {
     "INPUT_ACCESS_DENIED": (4, "Input must be a public regular JSON file inside the workspace."),
     "INPUT_TOO_LARGE": (2, "Input exceeds the request size limit."),
     "TIMEOUT": (5, "The command exceeded its time limit."),
-    "INTERNAL_ERROR": (1, "The offline command could not complete."),
+    "INTERNAL_ERROR": (1, "The operation could not complete."),
     "OUTPUT_TOO_LARGE": (1, "The result exceeds the output size limit."),
-    "INTERRUPTED": (130, "The offline command was interrupted."),
+    "INTERRUPTED": (130, "The operation was interrupted."),
     "AUTHORIZATION_REQUIRED": (6, "A valid operator-managed executor binding is required."),
     "TARGET_MISMATCH": (7, "The request or observed target does not match the executor binding."),
     "TARGET_DRIFT": (7, "The target changed during the operation."),
@@ -39,7 +39,7 @@ ERRORS = {
     "PERMISSION_DENIED": (8, "The bound identity lacks the required diagnostic permissions."),
     "CONNECTION_FAILED": (8, "The bound database connection could not be established."),
     "VERIFICATION_FAILED": (8, "The requested live verification did not pass."),
-    "RECOVERY_REQUIRED": (9, "An owned diagnostic resource needs executor cleanup."),
+    "RECOVERY_REQUIRED": (9, "The operation needs state reconciliation or scoped recovery."),
 }
 
 

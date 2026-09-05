@@ -23,10 +23,10 @@ M2부터 스킬 연계를 작게 검증한다. 모든 Kubernetes 기능이 생�
 
 ## 바로 이어서 할 첫 작업
 
-1. M2의 실제 검사 경로를 유지하며 M3 lifecycle executor를 구현한다.
-2. M3에서 새 disposable 대상의 PKI 발급·소유한 HBA/ident 적용·credential 전달을 연결한다.
-3. 적용 전 snapshot/CAS·lock·NOLOGIN 순서·실패/재개/소유 범위 복구를 실제 PostgreSQL로 검증한다.
-4. 위 경로가 통과한 뒤 기존 voc-db의 승인된 상태와 전환·보존 범위를 구체화한다.
+1. 내부 lifecycle의 검증 결과를 유지하며 공개 `prepare`·`issue`·`apply`·`deliver`·`rollback`·`status` JSON CLI를 연결한다.
+2. 새 certificate 세대의 rotation·검증 후 전환·이전 세대 복구와 재시도 계약을 구현한다.
+3. Query Man DBA consumer에서 새 version/capability·계획 참조·오류/복구 상태를 검증한다.
+4. 위 경로와 설치 패키지 E2E가 통과한 뒤 기존 voc-db의 승인된 상태와 전환·보존 범위를 구체화한다.
 
 기존 DB/credential/백업/기록은 보존한다. M1 계획은 여전히 executable false이며 live snapshot이나
 실행 승인 artifact로 재사용하지 않는다. M2 검사 성공도 기존 도구·credential 폐기 근거가 아니다.
@@ -191,3 +191,21 @@ pytest 575개 통과(11 deselected). Admin의 실제 offline plan과 DBA helper 
 Docker/issuer의 private stdin은 1 MiB로 제한하고 입출력을 동시에 처리해 쓰기 중 timeout도
 강제한다. 관련 process·binding·PKI·state 검사 126개와 Ruff·Mypy를 통과했다.
 아직 내부 모듈 검증이며, 공개 쓰기 명령이나 DB 적용·전달·복구 E2E 완료를 뜻하지 않는다.
+
+M3 내부 coordinator는 계획·대상·승인 범위를 묶고 단계별 journal로 발급·DB 적용·전달·복구를
+연결한다. 별도 apply receipt의 CA bundle digest를 이후 검증에도 사용한다. 전달은 새 버전의
+실제 UID 10001/TLS/인증과 인증서 없음·평문 거부 검사를 통과한 뒤에만 active pointer를 바꾼다.
+설정 교체는 실제 이전 inode를 보존하고 배타적으로 새 파일을 게시하며, 복구는 소유한 구간만
+제거한다. 상세 범위와 재현 명령은 [로컬 lifecycle](local-lifecycle.md)에 있다.
+공개 쓰기 CLI·rotation·기존 voc-db 사용 전환은 미완료다.
+
+2026-09-05 M3 내부 통합 gate: `QUERY_PASSPORT_DOCKER_TESTS=1 uv run --locked pytest -q --tb=short`
+**841개 통과**(217.56초). Unit/process 809개와 실제 Docker 검사 32개(M2 23개, M3 fixture 1개,
+M3 lifecycle 8개)를 함께 실행했다. 정상 발급→적용→전달→검증→복구, 중복 실행, 응답 유실 후
+재개, 전달 전 검증 실패, PUBLIC 업무 권한 거절, 후속 HBA 변경 보존, CA 내용 drift, 실제로
+로드된 trust 규칙과 디스크 규칙이 다른 경우의 거부를 확인했다. 기존 fixture identity는
+적용·복구 전후의 별도 실제 연결로 보존을 확인했다.
+Ruff lint/format, Mypy 소스 16개 파일, wheel/sdist 빌드와 내부 문서 링크 33개도 통과했다.
+Wheel에 필요한 내부 모듈과 cryptography 의존성이 포함되고 credential artifact가 없음을 확인했다.
+이 결과는 내부 API와 새 disposable 대상의 검증이며, 공개 쓰기 CLI/설치 패키지의 M3 실행 및
+실제 voc-db 사용 전환을 완료했다는 뜻이 아니다. 기존 voc-db·기존 인증서·호스트 백업은 보존했다.
