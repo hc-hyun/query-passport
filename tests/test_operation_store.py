@@ -14,6 +14,38 @@ def state_home(tmp_path, monkeypatch):
     return tmp_path
 
 
+def test_executor_state_does_not_repair_or_read_legacy_namespace(state_home):
+    legacy = state_home / ".local/state/query-passport"
+    legacy.mkdir(parents=True)
+    legacy.parent.chmod(0o700)
+    legacy.parent.parent.chmod(0o700)
+    legacy.chmod(0o775)
+    sentinel = legacy / "review.txt"
+    sentinel.write_text("preserve synthetic handoff")
+    before = (legacy.stat(), sentinel.stat())
+    with store.operation() as operation:
+        operation.record("prepared")
+    assert store.state_directory() == state_home / ".local/state/query-passport-executor/operations"
+    assert (legacy.stat(), sentinel.stat()) == before
+    assert sentinel.read_text() == "preserve synthetic handoff"
+    assert not (legacy / "operations").exists()
+
+
+def test_unsafe_executor_namespace_is_refused_without_fallback(state_home):
+    namespace = store.state_directory().parent
+    namespace.mkdir(parents=True)
+    namespace.parent.chmod(0o700)
+    namespace.parent.parent.chmod(0o700)
+    namespace.chmod(0o775)
+    before = namespace.stat()
+    with pytest.raises(store.StateError, match="STATE_ACCESS_DENIED"):
+        with store.operation():
+            pytest.fail("Unsafe namespace was accepted")
+    assert namespace.stat() == before
+    assert not store.state_directory().exists()
+    assert not (state_home / ".local/state/query-passport").exists()
+
+
 def test_state_backup_and_history_survive_reopening(state_home):
     with store.operation() as operation:
         operation_id = operation.operation_id

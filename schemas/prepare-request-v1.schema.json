@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Query Passport base request",
+  "title": "Query Passport prepare request",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -109,6 +109,15 @@
           "credential.rotate.local.v1"
         ]
       }
+    },
+    "intent": {
+      "type": "string",
+      "enum": [
+        "provision",
+        "rotate"
+      ],
+      "default": "provision"
     }
-  }
+  },
+  "description": "Public review request. An operator-managed binding is required; this input grants no authority."
 }

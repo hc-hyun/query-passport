@@ -1,7 +1,7 @@
 """Local operation coordinator; all paths and privileges come from operator bindings.
 
-This module is private until the CLI contract and disposable lifecycle gates are
-complete. Every mutating phase is recorded before the backend is invoked. A timeout
+The public CLI dispatches through the closed lifecycle contract. Every mutating
+phase is recorded before the backend is invoked. A timeout
 means unknown external state, not that the database transaction was rolled back.
 """
 
@@ -64,8 +64,9 @@ def issuer(binding: dict[str, Any], operation_id: str, input_digest: str) -> dic
                 key: metadata[key] for key in ("certificate_sha256", "not_before", "not_after")
             }
             if payload["command"] == "issue-client":
-                require(matches(metadata.get("authority_sha256"), r"sha256:[a-f0-9]{64}", 71))
-                selected["authority_sha256"] = metadata["authority_sha256"]
+                for name in ("authority_sha256", "server_ca_sha256"):
+                    require(matches(metadata.get(name), r"sha256:[a-f0-9]{64}", 71))
+                    selected[name] = metadata[name]
             return selected
         except ContractError as error:
             if error.code == "RECOVERY_REQUIRED":
@@ -151,6 +152,7 @@ def set_runtime_permissions(binding: dict[str, Any], candidate: Path) -> None:
         "chown 0:10001 /bundle /bundle/ca.crt /bundle/client.crt /bundle/client.key"
     )
     name = "query-passport-delivery-" + uuid.uuid4().hex
+    prior_error: BaseException | None = None
     try:
         executor.docker(
             [
@@ -183,19 +185,11 @@ def set_runtime_permissions(binding: dict[str, Any], candidate: Path) -> None:
             timeout=15,
             limit=1024,
         )
+    except BaseException as error:
+        prior_error = error
+        raise
     finally:
-        try:
-            executor.docker(["rm", "-f", name], timeout=5)
-        except ContractError:
-            try:
-                remaining = executor.docker(
-                    ["ps", "-a", "--filter", "name=^/" + name + "$", "--format", "{{.ID}}"],
-                    timeout=5,
-                )
-                if remaining.strip():
-                    raise ContractError("RECOVERY_REQUIRED")
-            except ContractError as error:
-                raise ContractError("RECOVERY_REQUIRED") from error
+        executor.cleanup_container(name, prior_error=prior_error)
 
 
 def _summary(plan: dict[str, Any], phase: str) -> dict[str, Any]:
@@ -219,38 +213,74 @@ def _summary(plan: dict[str, Any], phase: str) -> dict[str, Any]:
     }
 
 
-def prepare(request: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any]:
+def prepare(
+    request: dict[str, Any], binding: dict[str, Any], *, intent: str = "provision"
+) -> dict[str, Any]:
     from . import credential_delivery, db_admin
 
     request = validate(request)
+    require(intent in {"provision", "rotate"})
     validate_lifecycle_binding(binding, request, "prepare")
     with operation_store.target_lock(binding["container_id"]):
         target = executor.target_snapshot(binding)
         before = db_admin.snapshot(binding)
-        db_admin.validate_provision(binding, before)
         previous = credential_delivery.inspect_delivery(Path(binding["credential_dir"]))
-        if previous["generation_id"] is not None:
-            raise ContractError("TARGET_DRIFT")
+        rotation = None
+        if intent == "provision":
+            db_admin.validate_provision(binding, before)
+            if previous["generation_id"] is not None:
+                raise ContractError("TARGET_DRIFT")
+        else:
+            rotation = _prepare_rotation(request, binding, previous)
         if executor.target_snapshot(binding) != target:
             raise ContractError("TARGET_DRIFT")
         with operation_store.operation() as operation:
             plan = {
                 "version": 1,
                 "operation_id": operation.operation_id,
-                "intent": "provision",
+                "intent": intent,
                 "request": request,
                 "binding_digest": binding_digest(binding),
                 "target_snapshot": target,
                 "before": before,
                 "previous": previous,
             }
+            if rotation is not None:
+                plan["rotation"] = rotation
             encoded = canonical(plan)
             # Reuse the closed parser/depth limits on readback; reject before any
             # execution if a configuration cannot fit in a bounded private plan.
             parse_json(encoded)
             operation.write_artifact("plan.json", encoded)
             operation.record("prepared")
-            return _summary(plan, "prepared")
+            return {
+                **_summary(plan, "prepared"),
+                "actions": (
+                    [
+                        "issue_client_certificate",
+                        "create_restricted_check_role",
+                        "append_client_ca_trust",
+                        "install_owned_auth_rules",
+                        "publish_verified_credential",
+                    ]
+                    if intent == "provision"
+                    else [
+                        "issue_client_certificate",
+                        "verify_new_connections",
+                        "publish_verified_credential",
+                    ]
+                ),
+                "preserves": [
+                    "existing_database_objects",
+                    "existing_roles_and_grants",
+                    "existing_server_credentials",
+                    "existing_client_trust",
+                    "previous_credential_generations",
+                ],
+                "account": binding["username"],
+                "client_dn": binding["expected_dn"],
+                "certificate_lifetime_days": binding["lifecycle"]["lifetime_days"],
+            }
 
 
 def _load_plan(
@@ -274,12 +304,14 @@ def _load_plan(
             "before",
             "previous",
         },
+        {"rotation"},
     )
     if (
         plan["version"] != 1
         or type(plan["version"]) is not int
         or plan["operation_id"] != operation.operation_id
-        or plan["intent"] != "provision"
+        or plan["intent"] not in ("provision", "rotate")
+        or (plan["intent"] == "rotate") != ("rotation" in plan)
         or plan["request"] != request
         or plan["binding_digest"] != binding_digest(binding)
         or digest(plan) != plan_digest
@@ -310,6 +342,228 @@ def _applied_plan(operation: operation_store.Operation, plan: dict[str, Any]) ->
     return {**plan, "applied_ca_digest": receipt["ca_digest"]}
 
 
+def _prepare_rotation(
+    request: dict[str, Any], binding: dict[str, Any], previous: dict[str, Any]
+) -> dict[str, Any]:
+    from . import db_admin
+
+    previous_id = previous["generation_id"]
+    if previous_id is None:
+        raise ContractError("RECOVERY_REQUIRED")
+    with operation_store.operation(previous_id) as predecessor:
+        stored = parse_json(predecessor.read_artifact("plan.json"))
+        old_plan = _load_plan(predecessor, request, binding, digest(stored))
+        if predecessor.events()[-1]["phase"] != "verified":
+            raise ContractError("RECOVERY_REQUIRED")
+        if parse_json(predecessor.read_artifact("delivery.json")) != previous:
+            raise ContractError("TARGET_DRIFT")
+        issuance = parse_json(predecessor.read_artifact("issuance.json"))
+        old_owner = old_plan.get("rotation", {})
+        rotation = {
+            "owner_operation_id": old_owner.get("owner_operation_id", previous_id),
+            "owner_plan_digest": old_owner.get("owner_plan_digest", digest(old_plan)),
+            "predecessor_plan_digest": digest(old_plan),
+            "authority_sha256": issuance["authority_sha256"],
+            "server_ca_sha256": issuance["server_ca_sha256"],
+        }
+    owner = _rotation_owner(request, binding, {"rotation": rotation, "previous": previous})
+    db_admin.verify_applied(binding, owner, owner["operation_id"])
+    return rotation
+
+
+def _rotation_owner(
+    request: dict[str, Any], binding: dict[str, Any], plan: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve a verified predecessor and its original DB owner without copying history."""
+    rotation = plan["rotation"]
+    object_fields(
+        rotation,
+        {
+            "owner_operation_id",
+            "owner_plan_digest",
+            "predecessor_plan_digest",
+            "authority_sha256",
+            "server_ca_sha256",
+        },
+    )
+    require(matches(rotation["owner_operation_id"], r"[a-f0-9]{32}", 32))
+    for name in (
+        "owner_plan_digest",
+        "predecessor_plan_digest",
+        "authority_sha256",
+        "server_ca_sha256",
+    ):
+        require(matches(rotation[name], r"sha256:[a-f0-9]{64}", 71))
+    previous_id = plan["previous"]["generation_id"]
+    require(matches(previous_id, r"[a-f0-9]{32}", 32))
+    require(plan.get("operation_id") not in {previous_id, rotation["owner_operation_id"]})
+    with operation_store.operation(previous_id) as predecessor:
+        _load_plan(predecessor, request, binding, rotation["predecessor_plan_digest"])
+        if predecessor.events()[-1]["phase"] != "verified":
+            raise ContractError("RECOVERY_REQUIRED")
+        if parse_json(predecessor.read_artifact("delivery.json")) != plan["previous"]:
+            raise ContractError("TARGET_DRIFT")
+    with operation_store.operation(rotation["owner_operation_id"]) as original:
+        owner = _load_plan(original, request, binding, rotation["owner_plan_digest"])
+        if owner["intent"] != "provision" or original.events()[-1]["phase"] != "verified":
+            raise ContractError("RECOVERY_REQUIRED")
+        issuance = parse_json(original.read_artifact("issuance.json"))
+        if any(
+            issuance[name] != rotation[name] for name in ("authority_sha256", "server_ca_sha256")
+        ):
+            raise ContractError("TARGET_DRIFT")
+        return _applied_plan(original, owner)
+
+
+def _verify_generation(
+    operation: operation_store.Operation,
+    request: dict[str, Any],
+    binding: dict[str, Any],
+    applied_plan: dict[str, Any],
+    candidate: Path,
+) -> None:
+    from . import db_admin
+    from .policy_verification import run_policy_verification
+
+    operation.record("verifying")
+    db_admin.verify_applied(binding, applied_plan, applied_plan["operation_id"])
+    projected = verification_projection(binding, str(candidate))
+    for check in (executor.run_verification, run_policy_verification, executor.run_verification):
+        verified = check(projected, request)
+        if verified["status"] != "succeeded":
+            raise ContractError(verified["error"])
+    db_admin.verify_applied(binding, applied_plan, applied_plan["operation_id"])
+
+
+def _deliver_generation(
+    operation: operation_store.Operation,
+    plan: dict[str, Any],
+    request: dict[str, Any],
+    binding: dict[str, Any],
+    applied_plan: dict[str, Any],
+) -> None:
+    from . import credential_delivery, db_admin
+
+    db_admin.verify_applied(binding, applied_plan, applied_plan["operation_id"])
+    _save_once(operation, "issuance.json", issuer(binding, operation.operation_id, digest(plan)))
+    boundary_failure = None
+
+    def verify_candidate(candidate: Path) -> None:
+        nonlocal boundary_failure
+        try:
+            _verify_generation(operation, request, binding, applied_plan, candidate)
+        except ContractError as error:
+            boundary_failure = error.code
+            raise
+
+    def permissions(candidate: Path) -> None:
+        nonlocal boundary_failure
+        try:
+            set_runtime_permissions(binding, candidate)
+        except ContractError as error:
+            boundary_failure = error.code
+            raise
+
+    operation.record("delivering")
+    try:
+        delivered = credential_delivery.deliver(
+            Path(binding["lifecycle"]["generations_dir"]) / operation.operation_id / "bundle",
+            Path(binding["credential_dir"]),
+            operation.operation_id,
+            expected_revision=plan["previous"],
+            permission_setter=permissions,
+            validator=verify_candidate,
+        )
+    except Exception:
+        if boundary_failure is not None:
+            raise ContractError(boundary_failure) from None
+        raise
+    _save_once(
+        operation,
+        "delivery.json",
+        {key: delivered[key] for key in ("generation_id", "revision", "certificate_sha256")},
+    )
+    operation.record("delivered")
+
+
+def _check_rollback_pointer(plan: dict[str, Any], binding: dict[str, Any]) -> None:
+    from . import credential_delivery
+
+    active = credential_delivery.inspect_delivery(Path(binding["credential_dir"]))
+    if active["generation_id"] not in {plan["operation_id"], plan["previous"]["generation_id"]}:
+        # An older operation must not disable the account used by a newer active
+        # generation. Revert child rotations in order before the original DB plan.
+        raise ContractError("TARGET_DRIFT")
+
+
+def _execute_rotation(
+    command: str,
+    operation: operation_store.Operation,
+    plan: dict[str, Any],
+    request: dict[str, Any],
+    binding: dict[str, Any],
+) -> dict[str, Any]:
+    from . import credential_delivery, db_admin
+
+    if command not in {"rotate", "rollback"}:
+        raise ContractError("UNSUPPORTED_OPERATION")
+    phases = {event["phase"] for event in operation.events()}
+    _check_rollback_pointer(plan, binding)
+    if command != "rollback" and "rolling_back" in phases:
+        raise ContractError("RECOVERY_REQUIRED")
+    owner = _rotation_owner(request, binding, plan)
+    db_admin.verify_applied(binding, owner, owner["operation_id"])
+    operation.record("rolling_back" if command == "rollback" else "issuing")
+    try:
+        if command == "rotate":
+            if db_admin.snapshot(binding) != plan["before"]:
+                raise ContractError("TARGET_DRIFT")
+            metadata = issuer(binding, operation.operation_id, digest(plan))
+            if any(
+                metadata[name] != plan["rotation"][name]
+                for name in ("authority_sha256", "server_ca_sha256")
+            ):
+                raise ContractError("TARGET_DRIFT")
+            if metadata["certificate_sha256"] == plan["previous"]["certificate_sha256"]:
+                raise ContractError("VERIFICATION_FAILED")
+            _save_once(operation, "issuance.json", metadata)
+            operation.record("issued")
+            operation.record("checking_delivery")
+            _deliver_generation(operation, plan, request, binding, owner)
+            phase = "verified"
+        else:
+            if "delivering" in phases:
+                candidate = (
+                    Path(binding["credential_dir"])
+                    / "versions"
+                    / plan["previous"]["generation_id"]
+                    / "bundle"
+                )
+                _verify_generation(operation, request, binding, owner, candidate)
+                credential_delivery.rollback(
+                    Path(binding["credential_dir"]), operation.operation_id, plan["previous"]
+                )
+            phase = "rolled_back"
+        if executor.target_snapshot(binding) != plan["target_snapshot"]:
+            raise ContractError("TARGET_DRIFT")
+        operation.record(phase)
+        return _summary(plan, phase)
+    except BaseException as error:
+        code = (
+            error.code
+            if isinstance(error, ContractError)
+            else "INTERRUPTED"
+            if isinstance(error, (KeyboardInterrupt, SystemExit))
+            else "RECOVERY_REQUIRED"
+        )
+        operation.record(
+            "unknown" if code in {"TIMEOUT", "INTERRUPTED"} else "partial_failure", code
+        )
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise ContractError(code) from None
+
+
 def execute(
     command: str,
     request: dict[str, Any],
@@ -327,7 +581,7 @@ def execute(
 
     request = validate(request)
     validate_lifecycle_binding(binding, request, command)
-    require(command in {"issue", "apply", "deliver", "rollback", "status"})
+    require(command in {"issue", "apply", "deliver", "rotate", "rollback", "status"})
     require(matches(operation_id, r"[a-f0-9]{32}", 32))
     require(matches(plan_digest, r"sha256:[a-f0-9]{64}", 71))
     with operation_store.target_lock(binding["container_id"]):
@@ -346,6 +600,12 @@ def execute(
                 for field in ("db_connectivity", "authentication", "certificate_validation"):
                     result[field] = "not_checked"
                 return result
+            if plan["intent"] == "rotate":
+                return _execute_rotation(command, operation, plan, request, binding)
+            if command == "rotate":
+                raise ContractError("UNSUPPORTED_OPERATION")
+            if command == "rollback" and "delivering" in phases:
+                _check_rollback_pointer(plan, binding)
             stage = {
                 "issue": "issuing",
                 "apply": "applying",
@@ -370,7 +630,6 @@ def execute(
             if command != "rollback" and "rolling_back" in phases:
                 raise ContractError("RECOVERY_REQUIRED")
             operation.record(stage)
-            boundary_failure = None
             try:
                 if command == "issue":
                     if db_admin.snapshot(binding) != plan["before"]:
@@ -390,63 +649,9 @@ def execute(
                     db_admin.verify_applied(binding, _applied_plan(operation, plan), operation_id)
                     phase = "applied"
                 elif command == "deliver":
-                    applied_plan = _applied_plan(operation, plan)
-                    db_admin.verify_applied(binding, applied_plan, operation_id)
-                    _save_once(
-                        operation, "issuance.json", issuer(binding, operation_id, digest(plan))
+                    _deliver_generation(
+                        operation, plan, request, binding, _applied_plan(operation, plan)
                     )
-
-                    def verify_candidate(candidate: Path) -> None:
-                        nonlocal boundary_failure
-                        from .policy_verification import run_policy_verification
-
-                        operation.record("verifying")
-                        try:
-                            projected = verification_projection(binding, str(candidate))
-                            verified = executor.run_verification(projected, request)
-                            if verified["status"] != "succeeded":
-                                raise ContractError(verified["error"])
-                            policy = run_policy_verification(projected, request)
-                            if policy["status"] != "succeeded":
-                                raise ContractError(policy["error"])
-                            # A role disabled between the probes cannot make a
-                            # negative result masquerade as a valid cert policy.
-                            verified = executor.run_verification(projected, request)
-                            if verified["status"] != "succeeded":
-                                raise ContractError(verified["error"])
-                            db_admin.verify_applied(binding, applied_plan, operation_id)
-                        except ContractError as error:
-                            boundary_failure = error.code
-                            raise
-
-                    def permissions(candidate: Path) -> None:
-                        nonlocal boundary_failure
-                        try:
-                            set_runtime_permissions(binding, candidate)
-                        except ContractError as error:
-                            boundary_failure = error.code
-                            raise
-
-                    operation.record("delivering")
-                    delivered = credential_delivery.deliver(
-                        Path(binding["lifecycle"]["generations_dir"]) / operation_id / "bundle",
-                        Path(binding["credential_dir"]),
-                        operation_id,
-                        expected_revision=plan["previous"],
-                        permission_setter=permissions,
-                        validator=verify_candidate,
-                    )
-                    # The delivery module owns the immutable receipt and active CAS;
-                    # persist only the active revision in the operation journal.
-                    _save_once(
-                        operation,
-                        "delivery.json",
-                        {
-                            key: delivered[key]
-                            for key in ("generation_id", "revision", "certificate_sha256")
-                        },
-                    )
-                    operation.record("delivered")
                     phase = "verified"
                 else:
                     if "applying" in phases:
@@ -468,8 +673,6 @@ def execute(
                     if isinstance(error, (KeyboardInterrupt, SystemExit))
                     else "RECOVERY_REQUIRED"
                 )
-                if boundary_failure is not None:
-                    code = boundary_failure
                 operation.record(
                     "unknown" if code in {"TIMEOUT", "INTERRUPTED"} else "partial_failure", code
                 )

@@ -1,7 +1,9 @@
 # 운영 설계
 
-이 문서는 Query Passport의 운영 구현 목표다. 현재 M1 오프라인 CLI와 M2 로컬 Docker 읽기 전용 검증이 있으며 쓰기 기능과 Kubernetes 배포는 없고,
-이 문서 작성은 기존 DB·PKI·Secret 변경의 실행 승인이 아니다. 명령과 결과 형식은
+이 문서는 Query Passport의 운영 경계와 후속 구현 목표다. 현재 오프라인 CLI와 로컬 Docker 검증,
+제한된 발급·적용·전달·교체·복구를 제공한다. Kubernetes·운영 PKI·인증서 폐기는 미구현이며,
+이 문서 작성은 기존 DB·PKI·Secret 변경의 실행 승인이 아니다. 로컬 지원 범위는
+[로컬 lifecycle](local-lifecycle.md), 명령과 결과 형식은
 [Tool contract](tool-contract.md), 기존 작업의 위치와 한계는 [로컬 인계](local-handoff.md)를 따른다.
 
 ## 역할과 신뢰의 방향

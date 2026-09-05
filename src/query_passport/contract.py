@@ -15,10 +15,17 @@ MAX_INPUT_BYTES = 65536
 MAX_OUTPUT_BYTES = 16384
 MAX_DEPTH = 8
 TIMEOUT_SECONDS = 5
-POLICY_REVISION = "m2-local-docker-1"
-COMMANDS = ("capabilities", "inspect", "plan", "verify")
-FUTURE_COMMANDS = ("issue", "apply", "deliver", "rotate", "rollback")
-CAPABILITIES = ("profile.inspect.v1", "plan.offline.v1", "connection.verify.v1")
+LIFECYCLE_TIMEOUT_SECONDS = 180
+POLICY_REVISION = "m3-local-lifecycle-1"
+LIFECYCLE_COMMANDS = ("prepare", "issue", "apply", "deliver", "rotate", "rollback", "status")
+COMMANDS = ("capabilities", "inspect", "plan", "verify", *LIFECYCLE_COMMANDS)
+CAPABILITIES = (
+    "profile.inspect.v1",
+    "plan.offline.v1",
+    "connection.verify.v1",
+    "lifecycle.local.v1",
+    "credential.rotate.local.v1",
+)
 ERRORS = {
     "INVALID_INPUT": (2, "Input does not match the public request contract."),
     "UNSUPPORTED_OPERATION": (3, "The requested command or capability is not implemented."),
@@ -161,6 +168,10 @@ def envelope(
 
 
 def respond(command: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
+    if command in LIFECYCLE_COMMANDS:
+        from .lifecycle_contract import respond_lifecycle
+
+        return respond_lifecycle(command, request)
     if command == "verify":
         from .executor import verify_request
 
@@ -186,6 +197,7 @@ def respond(command: str, request: dict[str, Any] | None = None) -> dict[str, An
                     "json_depth": MAX_DEPTH,
                     "timeout_seconds": TIMEOUT_SECONDS,
                     "live_timeout_seconds": 60,
+                    "lifecycle_timeout_seconds": LIFECYCLE_TIMEOUT_SECONDS,
                 },
             },
         )

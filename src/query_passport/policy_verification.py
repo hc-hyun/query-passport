@@ -61,6 +61,7 @@ def run_policy_verification(binding: dict[str, Any], request: dict[str, Any]) ->
     snapshot = executor.target_snapshot(binding)
     descriptor = -1
     started = False
+    prior_error: BaseException | None = None
     name = "query-passport-policy-" + uuid.uuid4().hex
     try:
         descriptor = executor.private_directory(binding["credential_dir"], runtime_owner=True)
@@ -135,22 +136,17 @@ def run_policy_verification(binding: dict[str, Any], request: dict[str, Any]) ->
             executor.credential_revision(descriptor) != original
         ):
             raise ContractError("TARGET_DRIFT")
-        return normalize_worker_result(output)
+        result = normalize_worker_result(output)
+        if result["error"] in ("TIMEOUT", "INTERRUPTED"):
+            prior_error = ContractError(result["error"])
+        return result
     except (OSError, ValueError) as error:
         raise ContractError("CREDENTIAL_ACCESS_DENIED") from error
+    except BaseException as error:
+        prior_error = error
+        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
         if started:
-            try:
-                executor.docker(["rm", "-f", name], timeout=5)
-            except ContractError:
-                try:
-                    remaining = executor.docker(
-                        ["ps", "-a", "--filter", "name=^/" + name + "$", "--format", "{{.ID}}"],
-                        timeout=5,
-                    )
-                    if remaining.strip():
-                        raise ContractError("RECOVERY_REQUIRED")
-                except ContractError as error:
-                    raise ContractError("RECOVERY_REQUIRED") from error
+            executor.cleanup_container(name, prior_error=prior_error)

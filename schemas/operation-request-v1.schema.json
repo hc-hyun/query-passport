@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Query Passport base request",
+  "title": "Query Passport lifecycle operation request",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,7 +11,8 @@
     "deployment_alias",
     "target_alias",
     "profile",
-    "source_count"
+    "source_count",
+    "operation"
   ],
   "properties": {
     "contract_version": {
@@ -109,6 +110,25 @@
           "credential.rotate.local.v1"
         ]
       }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "plan_digest"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{32}(?![\\s\\S])"
+        },
+        "plan_digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}(?![\\s\\S])"
+        }
+      }
     }
-  }
+  },
+  "description": "For issue, apply, deliver, rotate, rollback and status. An operation reference selects a private plan and grants no authority."
 }

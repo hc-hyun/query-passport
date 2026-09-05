@@ -196,3 +196,115 @@ def test_in_place_credential_change_is_detected(tmp_path):
         assert executor.credential_revision(descriptor) != before
     finally:
         os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [ContractError("TIMEOUT"), ContractError("INTERRUPTED"), KeyboardInterrupt(), SystemExit(1)],
+)
+@pytest.mark.parametrize("cleanup", ["absent", "remaining", "observation_failed", "interrupted"])
+def test_verification_uncertainty_survives_cleanup_failure(
+    binding, tmp_path, monkeypatch, failure, cleanup
+):
+    binding["credential_dir"] = str(tmp_path)
+    for name in ("ca.crt", "client.crt", "client.key"):
+        (tmp_path / name).write_bytes(b"synthetic offline fixture")
+    monkeypatch.setattr(executor, "target_snapshot", lambda _: "fixed-generation")
+    calls = []
+
+    def docker(args, **kwargs):
+        calls.append((args, kwargs))
+        if args[0] == "run":
+            raise failure
+        assert kwargs == {"timeout": 5}
+        if args[0] == "rm":
+            if cleanup == "interrupted":
+                raise KeyboardInterrupt()
+            raise ContractError("EXECUTOR_FAILED")
+        assert args[0] == "ps"
+        if cleanup == "observation_failed":
+            raise ContractError("EXECUTOR_FAILED")
+        return b"" if cleanup == "absent" else b"remaining"
+
+    monkeypatch.setattr(executor, "docker", docker)
+    with pytest.raises(type(failure)) as caught:
+        executor.run_verification(binding, REQUEST)
+    assert caught.value is failure
+    assert [call[0][0] for call in calls] == ["run", "rm", "ps"]
+    name = calls[0][0][calls[0][0].index("--name") + 1]
+    assert calls[1][0] == ["rm", "-f", name]
+    assert calls[2][0][3] == "name=^/" + name + "$"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [ContractError("TIMEOUT"), ContractError("INTERRUPTED"), KeyboardInterrupt(), SystemExit(1)],
+)
+@pytest.mark.parametrize("stage", ["rm", "ps"])
+@pytest.mark.parametrize("remaining", [b"", b"remaining"])
+def test_cleanup_first_uncertainty_is_preserved_even_after_reconciliation(
+    monkeypatch, failure, stage, remaining
+):
+    calls = []
+
+    def docker(args, **kwargs):
+        calls.append(args[0])
+        assert kwargs == {"timeout": 5}
+        if args[0] == stage:
+            raise failure
+        if args[0] == "rm":
+            raise ContractError("EXECUTOR_FAILED")
+        return remaining
+
+    monkeypatch.setattr(executor, "docker", docker)
+    with pytest.raises(type(failure)) as caught:
+        executor.cleanup_container("query-passport-verify-" + "a" * 32)
+    assert caught.value is failure
+    assert calls == ["rm", "ps"]
+
+
+@pytest.mark.parametrize("remaining", [b"", b"remaining"])
+def test_cleanup_known_failure_requires_positive_absence_observation(monkeypatch, remaining):
+    def docker(args, **kwargs):
+        if args[0] == "rm":
+            raise ContractError("EXECUTOR_FAILED")
+        return remaining
+
+    monkeypatch.setattr(executor, "docker", docker)
+    name = "query-passport-verify-" + "a" * 32
+    if remaining:
+        with pytest.raises(ContractError) as caught:
+            executor.cleanup_container(name)
+        assert caught.value.code == "RECOVERY_REQUIRED"
+    else:
+        assert executor.cleanup_container(name) is None
+
+
+@pytest.mark.parametrize("name", ["existing-database", "query-passport-verify-*", ""])
+def test_cleanup_cannot_select_unowned_container_names(monkeypatch, name):
+    monkeypatch.setattr(executor, "docker", lambda *_args, **_kwargs: pytest.fail("No Docker"))
+    with pytest.raises(ContractError) as caught:
+        executor.cleanup_container(name)
+    assert caught.value.code == "AUTHORIZATION_REQUIRED"
+
+
+def test_worker_timeout_result_is_not_replaced_by_cleanup_failure(binding, tmp_path, monkeypatch):
+    from query_passport.verify_worker import CHECK_NAMES
+
+    binding["credential_dir"] = str(tmp_path)
+    for name in ("ca.crt", "client.crt", "client.key"):
+        (tmp_path / name).write_bytes(b"synthetic offline fixture")
+    result = {
+        "status": "failed",
+        "checks": dict.fromkeys(CHECK_NAMES, "not_checked"),
+        "error": "TIMEOUT",
+    }
+    monkeypatch.setattr(executor, "target_snapshot", lambda _: "fixed-generation")
+
+    def docker(args, **kwargs):
+        if args[0] == "run":
+            return json.dumps(result).encode()
+        raise ContractError("EXECUTOR_FAILED")
+
+    monkeypatch.setattr(executor, "docker", docker)
+    assert executor.run_verification(binding, REQUEST) == result

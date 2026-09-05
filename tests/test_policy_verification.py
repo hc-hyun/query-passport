@@ -445,3 +445,61 @@ def test_failed_result_preserves_only_fixed_classification():
     assert result["error"] == "TIMEOUT"
     assert "PRIVATE_PROVIDER_DIAGNOSTIC" not in json.dumps(result)
     assert runner.normalize_worker_result(json.dumps(result).encode()) == result
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [ContractError("TIMEOUT"), ContractError("INTERRUPTED"), KeyboardInterrupt(), SystemExit(1)],
+)
+@pytest.mark.parametrize("cleanup", ["remaining", "observation_failed", "interrupted"])
+def test_policy_probe_uncertainty_survives_docker_cleanup(binding, monkeypatch, failure, cleanup):
+    monkeypatch.setattr(executor, "target_snapshot", lambda _: "fixed-generation")
+    calls = []
+
+    def docker(args, **kwargs):
+        calls.append(args)
+        if args[0] == "run":
+            raise failure
+        assert kwargs == {"timeout": 5}
+        if args[0] == "rm":
+            if cleanup == "interrupted":
+                raise KeyboardInterrupt()
+            raise ContractError("EXECUTOR_FAILED")
+        if cleanup == "observation_failed":
+            raise ContractError("EXECUTOR_FAILED")
+        return b"remaining"
+
+    monkeypatch.setattr(executor, "docker", docker)
+    with pytest.raises(type(failure)) as caught:
+        runner.run_policy_verification(binding, REQUEST)
+    assert caught.value is failure
+    assert [call[0] for call in calls] == ["run", "rm", "ps"]
+    name = calls[0][calls[0].index("--name") + 1]
+    assert name.startswith("query-passport-policy-")
+    assert calls[1] == ["rm", "-f", name]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [ContractError("TIMEOUT"), ContractError("INTERRUPTED"), KeyboardInterrupt(), SystemExit(1)],
+)
+def test_successful_probe_does_not_hide_cleanup_uncertainty(binding, monkeypatch, failure):
+    monkeypatch.setattr(executor, "target_snapshot", lambda _: "fixed-generation")
+
+    def docker(args, **kwargs):
+        if args[0] == "run":
+            return json.dumps(SUCCESS).encode()
+        if args[0] == "rm":
+            raise failure
+        return b""
+
+    monkeypatch.setattr(executor, "docker", docker)
+    with pytest.raises(type(failure)) as caught:
+        runner.run_policy_verification(binding, REQUEST)
+    assert caught.value is failure
+
+
+def test_policy_worker_timeout_result_survives_cleanup_failure(binding, monkeypatch):
+    result = {"status": "failed", "checks": worker.new_checks(), "error": "TIMEOUT"}
+    host_fake(monkeypatch, response=result, cleanup="remaining")
+    assert runner.run_policy_verification(binding, REQUEST) == result

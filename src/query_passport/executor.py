@@ -55,6 +55,47 @@ def docker(
     return output
 
 
+def _uncertain(error: BaseException | None) -> bool:
+    return isinstance(error, (KeyboardInterrupt, SystemExit)) or (
+        isinstance(error, ContractError) and error.code in {"TIMEOUT", "INTERRUPTED"}
+    )
+
+
+def cleanup_container(name: str, *, prior_error: BaseException | None = None) -> None:
+    """Reconcile one fresh owned container without replacing an uncertain outcome.
+
+    The caller retains and rethrows its original exception. A timeout or interrupt
+    first encountered during cleanup also remains uncertain, even if a later
+    observation finds the container absent; observation does not complete the
+    interrupted Docker request.
+    """
+    if not matches(name, r"query-passport-(?:verify|policy|delivery)-[a-f0-9]{32}", 96):
+        raise ContractError("AUTHORIZATION_REQUIRED")
+    cleanup_error: BaseException | None = None
+    try:
+        docker(["rm", "-f", name], timeout=5)
+    except BaseException as removal_error:  # noqa: BLE001 - preserve the first uncertainty
+        try:
+            remaining = docker(
+                ["ps", "-a", "--filter", "name=^/" + name + "$", "--format", "{{.ID}}"],
+                timeout=5,
+            )
+            if remaining.strip():
+                cleanup_error = ContractError("RECOVERY_REQUIRED")
+        except BaseException as observation_error:  # noqa: BLE001 - bounded cleanup classification
+            cleanup_error = (
+                observation_error
+                if _uncertain(observation_error)
+                else ContractError("RECOVERY_REQUIRED")
+            )
+        if _uncertain(removal_error):
+            cleanup_error = removal_error
+        elif not isinstance(removal_error, ContractError):
+            cleanup_error = cleanup_error or ContractError("RECOVERY_REQUIRED")
+    if cleanup_error is not None and not _uncertain(prior_error):
+        raise cleanup_error
+
+
 def binding_directory() -> Path:
     return Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".config/query-passport/executors"
 
@@ -230,6 +271,7 @@ def run_verification(binding: dict[str, Any], request: dict[str, Any]) -> dict[s
     # immediately before/after execution. Credential worker pins each file by FD.
     descriptor = -1
     started = False
+    prior_error: BaseException | None = None
     name = "query-passport-verify-" + uuid.uuid4().hex
     try:
         descriptor = private_directory(binding["credential_dir"], runtime_owner=True)
@@ -304,26 +346,21 @@ def run_verification(binding: dict[str, Any], request: dict[str, Any]) -> dict[s
             credential_revision(descriptor) != original
         ):
             raise ContractError("TARGET_DRIFT")
-        return normalize_worker_result(output)
+        result = normalize_worker_result(output)
+        if result["error"] in ("TIMEOUT", "INTERRUPTED"):
+            prior_error = ContractError(result["error"])
+        return result
     except (OSError, ValueError) as error:
         raise ContractError("CREDENTIAL_ACCESS_DENIED") from error
+    except BaseException as error:
+        prior_error = error
+        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
         # Only remove the fresh diagnostic container owned by this invocation.
         if started:
-            try:
-                docker(["rm", "-f", name], timeout=5)
-            except ContractError:
-                try:
-                    remaining = docker(
-                        ["ps", "-a", "--filter", "name=^/" + name + "$", "--format", "{{.ID}}"],
-                        timeout=5,
-                    )
-                    if remaining.strip():
-                        raise ContractError("RECOVERY_REQUIRED")
-                except ContractError as error:
-                    raise ContractError("RECOVERY_REQUIRED") from error
+            cleanup_container(name, prior_error=prior_error)
 
 
 def credential_revision(directory: int) -> list[tuple[int, ...] | None]:

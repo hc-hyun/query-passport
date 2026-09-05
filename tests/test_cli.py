@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from query_passport import cli
-from query_passport.contract import ContractError, decode, respond
+from query_passport.contract import LIFECYCLE_COMMANDS, ContractError, decode, respond
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUEST_BYTES = (ROOT / "examples/request.json").read_bytes()
@@ -41,7 +41,7 @@ def run(*args, data=None, cwd=ROOT):
         "errors",
     }
     assert response["contract_version"] == "1"
-    assert response["tool_version"] == "0.2.0"
+    assert response["tool_version"] == "0.3.0"
     assert MARKER.encode() not in completed.stdout
     return completed.returncode, response
 
@@ -61,9 +61,7 @@ def test_discovery(args):
     assert result["command"] == "capabilities"
 
 
-@pytest.mark.parametrize(
-    "command", ["issue", "apply", "deliver", "rotate", "rollback", MARKER, "psql"]
-)
+@pytest.mark.parametrize("command", [MARKER, "psql", "grant", "deploy"])
 def test_unsupported_does_not_read_request(command):
     code, response = run(command, "--request", MARKER)
     assert code == 3
@@ -220,9 +218,10 @@ def test_output_limit(monkeypatch, capfd):
     assert json.loads(capfd.readouterr().out)["errors"][0]["code"] == "OUTPUT_TOO_LARGE"
 
 
-def test_stdin_timeout():
+@pytest.mark.parametrize("command", ["plan", "apply"])
+def test_stdin_timeout(command):
     process = subprocess.Popen(
-        [sys.executable, "-m", "query_passport", "plan", "--request", "-"],
+        [sys.executable, "-m", "query_passport", command, "--request", "-"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -278,3 +277,21 @@ def test_interrupt_is_json(monkeypatch, capfd):
     captured = capfd.readouterr()
     assert captured.err == ""
     assert json.loads(captured.out)["errors"][0]["code"] == "INTERRUPTED"
+
+
+@pytest.mark.parametrize("command", LIFECYCLE_COMMANDS)
+def test_lifecycle_cli_recognizes_commands_and_rejects_wrong_request_shape(command):
+    request = copy.deepcopy(REQUEST)
+    if command == "prepare":
+        request["operation"] = {"id": "a" * 32, "plan_digest": "sha256:" + "b" * 64}
+    code, response = run(command, "--request", "-", data=json.dumps(request).encode())
+    assert code == 2 and response["command"] == command
+    assert response["errors"][0]["code"] == "INVALID_INPUT"
+    assert response["result"] == {}
+
+
+@pytest.mark.parametrize("command", LIFECYCLE_COMMANDS)
+def test_lifecycle_cli_has_no_approval_bypass_flags(command):
+    code, response = run(command, "--request", "-", "--yes", data=REQUEST_BYTES)
+    assert code == 2 and response["errors"][0]["code"] == "INVALID_INPUT"
+    assert response["result"] == {}

@@ -1,10 +1,10 @@
 # 개발 계획
 
-Status: M1·M2 완료 / M3 구현 중 / M4–M5 미구현
+Status: M1·M2·M3 로컬 구현 / 기존 voc-db 전환 검증 진행 / M4·운영 M5 미구현
 
-M1의 Python + uv package·오프라인 계약과 M2의 로컬 Docker `verify`를 구현했다.
-M1·M2 지원 계약은 [Tool contract](tool-contract.md)와 [로컬 executor](local-executor.md)에 있으며
-M3 이후는 설계안이다.
+Python + uv package·오프라인 계약, 로컬 Docker 검증과 M3 발급·적용·전달·복구를 구현했다.
+같은 CA의 로컬 credential rotation도 지원한다. 구현 계약은 [Tool contract](tool-contract.md),
+[로컬 executor](local-executor.md), [로컬 lifecycle](local-lifecycle.md)에 있으며 운영 backend는 후속 설계다.
 실제 작업 경계는 [운영 설계](operations.md)가 소유한다.
 문서를 작성했다는 이유로 외부 DB나 Kubernetes 실행이 승인되지는 않는다.
 
@@ -14,7 +14,7 @@ M3 이후는 설계안이다.
 |---|---|---|---|
 | M1 (완료) | 오프라인 계획을 스킬이 읽을 수 있게 만들기 | 단일 CLI/package, 요청 검증, version/capabilities, `plan` JSON, 사용 예시 | DB·Docker·PKI·Secret 접근 없이 정상/오류 결과를 예측 가능하게 반환 |
 | M2 (완료) | 승인된 대상의 실제 연결 검증 | Docker 대상 확인, profile별 credential 전달 검증, live `verify`, 스킬의 최소 연계 | 정확한 대상에서 긍정/부정 접속 검사와 스킬 결과 해석이 재현됨 |
-| M3 | 로컬 테스트 환경의 인증 준비 자동화 | 테스트 PKI 발급, 제한된 DB 인증 적용, 외부 상태 관리, 실패·재개·복구, DBA 스킬의 해당 호출 | 새 disposable DB에서 준비→검증→실패복구를 수행하고 기존 설정을 보존 |
+| M3 (로컬 구현) | 로컬 테스트 환경의 인증 준비 자동화 | 테스트 PKI 발급, 제한된 DB 인증 적용, 외부 상태 관리, 실패·재개·복구, DBA 스킬의 해당 호출 | 새 disposable DB에서 준비→검증→실패복구를 수행하고 기존 설정을 보존 |
 | M4 | Pod에 credential을 공급하기 | 선택한 Secret provider 경로, manifest template, Pod UID/권한·DNS 검증, 별도 검증 Job | Pod 재생성·다른 node 배치 후에도 승인된 서비스 identity로 접속 |
 | M5 | 갱신과 운영 인계 마무리 | rotation/폐기/복구 흐름, 만료 관리, consumer 호환 테스트, 운영 PKI·기록 체계 연계 | 새 인증서 전환과 장애 복구, 기록 보존, 전체 스킬 호출 계약을 환경별로 검증 |
 
@@ -23,10 +23,11 @@ M2부터 스킬 연계를 작게 검증한다. 모든 Kubernetes 기능이 생�
 
 ## 바로 이어서 할 첫 작업
 
-1. 내부 lifecycle의 검증 결과를 유지하며 공개 `prepare`·`issue`·`apply`·`deliver`·`rollback`·`status` JSON CLI를 연결한다.
-2. 새 certificate 세대의 rotation·검증 후 전환·이전 세대 복구와 재시도 계약을 구현한다.
-3. Query Man DBA consumer에서 새 version/capability·계획 참조·오류/복구 상태를 검증한다.
-4. 위 경로와 설치 패키지 E2E가 통과한 뒤 기존 voc-db의 승인된 상태와 전환·보존 범위를 구체화한다.
+1. 기존 voc-db의 승인된 관리자 접속 수단을 확인한다. 현재 고정 local postgres socket의 최소 SELECT가 인증 단계에서 거부되어 catalog 검사는 미완료다.
+2. 그 수단에서 제한된 catalog를 확인하고 새 확인 identity·외부 PKI·전달·기록 위치를 고정한다.
+3. 기존 role·server credential·trust·데이터를 보존하는 구체적인 전환 계획을 작성한다. 기존 권한 충돌은 자동 revoke로 해결하지 않는다.
+4. 기존 helper·credential 경로를 참조하지 않는 환경에서 실제 새 연결·재발급·복구와 스킬 호출을 검증한다.
+5. 새 연결 사용 전환과 이전 신뢰·복구·백업 보존 조건을 확인한 뒤 로컬 도구 사용을 전환한다.
 
 기존 DB/credential/백업/기록은 보존한다. M1 계획은 여전히 executable false이며 live snapshot이나
 실행 승인 artifact로 재사용하지 않는다. M2 검사 성공도 기존 도구·credential 폐기 근거가 아니다.
@@ -143,7 +144,7 @@ M1 사용 점검 후 workspace 경로 전체의 symlink 거절과 닫힌 stdout�
 미지원 명령/capability, JSON 크기·중첩·중복 key·UTF-8, symlink/hardlink/FIFO·workspace 경계,
 입력값·예외 비노출, 네트워크·credential 미접근, stdin timeout과 출력 제한을 검증한다.
 전체 Query Man YAML/source validator는 실행하지 않는다. 실제 인증서 거부·target drift는 아래 M2 기록으로 별도 검증했다. 일부 적용 실패·설정 복구의
-전체 lifecycle은 M3의 남은 검증이며 M1/M2 통과로 대신하지 않는다. CI는 미구현이다.
+전체 lifecycle은 아래 별도의 M3 결과로 검증하며 M1/M2 통과로 대신하지 않는다. CI는 미구현이다.
 M2부터 bounded integration, M3부터 failure/recovery, M4부터 container/Pod 검증을 추가한다.
 
 구현 결과는 지원 capability, 아직 없는 기능, exact code/artifact revision, 수행한 검사와 실제 외부
@@ -177,7 +178,7 @@ integration 23개를 통과했다.
 HBA/ident의 소유 block만 생성·비교·복구하는 순수 helper를 구현하고 125개 테스트로 검증했다.
 기존 block 교체에는 원문 digest 일치가 필요하며, 복구는 다른 작업의 변경을 보존한다.
 이 helper만으로 DB 파일 쓰기·reload·NOLOGIN·PKI 발급·전달·실패복구를 완료했다고 판단하지 않는다.
-실제 lifecycle executor와 disposable E2E는 다음 구현 대상이다.
+이는 초기 순수 helper 검증 기록이며 이후 전체 lifecycle 검증은 아래 기록을 따른다.
 
 M2 완료 provenance: Passport `4d5d8db`, Query Man consumer `8d7e93b`. Passport unit/process 및
 실제 Docker integration을 한 번에 실행해 358개 통과. Query Man 전체 gate는 Ruff·Mypy 및
@@ -197,7 +198,7 @@ M3 내부 coordinator는 계획·대상·승인 범위를 묶고 단계별 journ
 실제 UID 10001/TLS/인증과 인증서 없음·평문 거부 검사를 통과한 뒤에만 active pointer를 바꾼다.
 설정 교체는 실제 이전 inode를 보존하고 배타적으로 새 파일을 게시하며, 복구는 소유한 구간만
 제거한다. 상세 범위와 재현 명령은 [로컬 lifecycle](local-lifecycle.md)에 있다.
-공개 쓰기 CLI·rotation·기존 voc-db 사용 전환은 미완료다.
+이 내부 backend 검증 시점에는 공개 쓰기 CLI·rotation·기존 voc-db 사용 전환이 미완료였다.
 
 2026-09-05 M3 내부 통합 gate: `QUERY_PASSPORT_DOCKER_TESTS=1 uv run --locked pytest -q --tb=short`
 **841개 통과**(217.56초). Unit/process 809개와 실제 Docker 검사 32개(M2 23개, M3 fixture 1개,
@@ -209,3 +210,36 @@ Ruff lint/format, Mypy 소스 16개 파일, wheel/sdist 빌드와 내부 문서 
 Wheel에 필요한 내부 모듈과 cryptography 의존성이 포함되고 credential artifact가 없음을 확인했다.
 이 결과는 내부 API와 새 disposable 대상의 검증이며, 공개 쓰기 CLI/설치 패키지의 M3 실행 및
 실제 voc-db 사용 전환을 완료했다는 뜻이 아니다. 기존 voc-db·기존 인증서·호스트 백업은 보존했다.
+
+
+### 0.3.0 공개 로컬 CLI와 교체
+
+`prepare`·`issue`·`apply`·`deliver`·`rotate`·`rollback`·`status`의 닫힌 JSON 입력과 정제된 결과를
+구현했다. Opaque operation 참조는 실행 권한을 대신하지 않으며 실패 결과는 실제 phase를 추측하지
+않는다. 같은 CA·identity의 새 세대는 실제 신규 연결 검증 후 전환하고, 이전 credential 복구는
+직전 세대를 다시 검증한 뒤에만 수행한다. 자식 rotation이 활성인 동안 원본 DB rollback은 거절한다.
+
+공개 실행 기록은 새 고정 namespace `~/.local/state/query-passport-executor/operations`를 사용한다.
+기존 `query-passport` 인계·리뷰 디렉터리의 권한·내용을 변경하거나 이전 기록을 자동 이전하지 않는다.
+Timeout·중단은 cleanup 실패에도 보존하여 확정되지 않은 실행을 `unknown`으로 기록한다.
+
+별도 wheel·잠금 파일 기반 runtime 의존성·독립 virtualenv의 exact CLI E2E 1개가 통과했다(55.83초).
+실제 발급·DB 적용·전달·접속·교체·자식 보호·credential 복구·DB 설정 복구·재호출·상태 조회를
+확인했고, 새 fingerprint와 정확한 이전 revision 복구 및 양쪽 발급 세대 보존을 확인했다.
+Query Man consumer는 0.3.0과 실제 lifecycle 오류 응답의 null scope·복구 참조를 검증한다.
+기존 voc-db·기존 인증서·CA·호스트 백업은 이 disposable 검증의 대상으로 사용하지 않았다.
+0.3.0 전체 Passport gate는 `QUERY_PASSPORT_DOCKER_TESTS=1 uv run --locked pytest -q --tb=short`
+**1080개 통과**(298.00초), Ruff lint/format·Mypy 소스 17개 파일·wheel/sdist 빌드 통과다.
+내부 문서 링크 41개와 갱신한 실제 plan JSON을 확인했다. 이어서 실제 Query Man DBA helper →
+설치 wheel → 새 DB의 별도 E2E 1개가 통과했다(60.48초). 이 경로에서도 발급·적용·전달·검증·
+교체·복구와 TARGET_DRIFT의 오류 코드·미확정 결과·operation 참조 보존을 확인했다.
+Query Man 전체 gate는 **732개 통과, 11 deselected**, Ruff·Mypy 소스 25개 파일 통과다.
+검증은 각 저장소의 현재 0.3.0 변경에 대응하며 commit 식별자는 coordinating Git 기록을 따른다.
+
+
+현재 voc-db의 선택적 Docker metadata와 공개 profile을 대조했다. `psql --version`은 성공했지만
+고정 local postgres socket의 최소 `SELECT 1`과 session prefix를 포함한 동일 검사는 모두
+인증 단계에서 거부되었다. 현재 DB catalog·PUBLIC 실효 권한·TLS 설정 검증은 미완료다.
+이 조사에서는 기존 credential·CA·설정·DB를 변경하지 않았으며 새 관리자 인증 수단을 추측하지 않았다.
+0.3.0의 disposable 성공은 기존 voc-db 도구 사용 전환 완료를 뜻하지 않는다.
+Query Man 0.3.0 consumer 구현 commit은 `d0b4581`이다.

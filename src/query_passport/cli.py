@@ -14,15 +14,16 @@ from typing import Never
 from .contract import (
     COMMANDS,
     ERRORS,
-    FUTURE_COMMANDS,
+    LIFECYCLE_COMMANDS,
+    LIFECYCLE_TIMEOUT_SECONDS,
     MAX_INPUT_BYTES,
     MAX_OUTPUT_BYTES,
     TIMEOUT_SECONDS,
     ContractError,
-    decode,
     envelope,
     respond,
 )
+from .lifecycle_contract import decode_request, failure_result
 
 
 class Parser(argparse.ArgumentParser):
@@ -116,12 +117,13 @@ def timeout_handler(signum: int, frame: FrameType | None) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     command = None
+    failure: dict[str, object] = {}
     exit_code = 0
     previous_handler = signal.signal(signal.SIGALRM, timeout_handler)
     signal.setitimer(signal.ITIMER_REAL, TIMEOUT_SECONDS)
     try:
         args = list(sys.argv[1:] if argv is None else argv)
-        if args and args[0] in COMMANDS + FUTURE_COMMANDS:
+        if args and args[0] in COMMANDS:
             command = args[0]
         if args in (["--version"], ["--help"]):
             command = "capabilities"
@@ -129,10 +131,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args == ["--help"]:
                 response["result"]["usage"] = (
                     "query-passport capabilities [--format json]; "
-                    "query-passport inspect|plan|verify --request FILE|- "
+                    "query-passport inspect|plan|verify|prepare|issue|apply|deliver|rotate|rollback|status "
+                    "--request FILE|- "
                     "[--workspace DIR] [--format json]"
                 )
-                response["result"]["unimplemented_commands"] = list(FUTURE_COMMANDS)
         else:
             if command not in COMMANDS:
                 raise ContractError("UNSUPPORTED_OPERATION")
@@ -146,29 +148,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             request = (
                 None
                 if command == "capabilities"
-                else decode(read_request(options.request, options.workspace))
+                else decode_request(command, read_request(options.request, options.workspace))
             )
+            failure = failure_result(command, request)
             if command == "verify":
                 signal.setitimer(signal.ITIMER_REAL, 60)
+            elif command in LIFECYCLE_COMMANDS:
+                signal.setitimer(signal.ITIMER_REAL, LIFECYCLE_TIMEOUT_SECONDS)
             response = respond(command, request)
             if response["errors"]:
                 exit_code = ERRORS[response["errors"][0]["code"]][0]
     except ContractError as error:
         exit_code = ERRORS[error.code][0]
-        response = envelope(command, "failed", {}, code=error.code)
-    except KeyboardInterrupt:
+        response = envelope(command, "failed", failure, code=error.code)
+    except (KeyboardInterrupt, SystemExit):
         exit_code = ERRORS["INTERRUPTED"][0]
-        response = envelope(command, "failed", {}, code="INTERRUPTED")
+        response = envelope(command, "failed", failure, code="INTERRUPTED")
     except Exception:  # noqa: BLE001 - public boundary must never leak raw exceptions
         exit_code = ERRORS["INTERNAL_ERROR"][0]
-        response = envelope(command, "failed", {}, code="INTERNAL_ERROR")
+        response = envelope(command, "failed", failure, code="INTERNAL_ERROR")
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
     output = json.dumps(response, ensure_ascii=True, separators=(",", ":")) + "\n"
     if len(output.encode()) > MAX_OUTPUT_BYTES:
         exit_code = ERRORS["OUTPUT_TOO_LARGE"][0]
-        output = json.dumps(envelope(command, "failed", {}, code="OUTPUT_TOO_LARGE")) + "\n"
+        output = json.dumps(envelope(command, "failed", failure, code="OUTPUT_TOO_LARGE")) + "\n"
     try:
         # One bounded write. No diagnostics, tracebacks, or user strings on stderr.
         if sys.stdout is None:

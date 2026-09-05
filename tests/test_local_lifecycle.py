@@ -26,6 +26,7 @@ EMPTY_REVISION = {"generation_id": None, "revision": None, "certificate_sha256":
 ISSUANCE = {
     "certificate_sha256": "sha256:" + "e" * 64,
     "authority_sha256": "sha256:" + "f" * 64,
+    "server_ca_sha256": "sha256:" + "d" * 64,
     "not_before": "2026-09-05T01:02:03+00:00",
     "not_after": "2026-10-05T01:02:03+00:00",
 }
@@ -139,6 +140,31 @@ def execute(command, binding, prepared, request=None):
 def events(prepared):
     with store.operation(prepared["operation_id"]) as operation:
         return operation.events()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [ContractError("TIMEOUT"), ContractError("INTERRUPTED"), KeyboardInterrupt(), SystemExit(1)],
+)
+@pytest.mark.parametrize("cleanup_result", ["failed", "remaining"])
+def test_permission_helper_cleanup_preserves_uncertain_execution(
+    monkeypatch, binding, tmp_path, failure, cleanup_result
+):
+    calls = []
+
+    def docker(arguments, **kwargs):
+        calls.append(arguments)
+        if arguments[0] == "run":
+            raise failure
+        if arguments[0] == "rm" or cleanup_result == "failed":
+            raise ContractError("EXECUTOR_FAILED")
+        return b"synthetic-container-id\n"
+
+    monkeypatch.setattr(executor, "docker", docker)
+    with pytest.raises(type(failure)) as raised:
+        lifecycle.set_runtime_permissions(binding, tmp_path / "synthetic-bundle")
+    assert raised.value is failure
+    assert [arguments[0] for arguments in calls] == ["run", "rm", "ps"]
 
 
 def artifact(prepared, name):

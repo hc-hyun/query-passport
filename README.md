@@ -8,17 +8,16 @@ Query Passport는 Query Man이 PostgreSQL에 접속할 때 필요한 인증서�
 
 ## 현재 상태와 다음 시작점
 
-현재는 **M1 오프라인 CLI와 M2 로컬 Docker 접속 검증 구현** 상태다. Python 3.12+와 uv로 설치하며 `capabilities`,
-`inspect`, `plan`, `verify`를 JSON으로 호출할 수 있다. 로컬 발급 모듈을 위해 `cryptography`를 사용한다.
-승인된 로컬 binding을 통한 실제 DB/TLS·인증서 검증을 지원한다. 발급·적용·전달·복구,
-Kubernetes, 자동 갱신과 CI는 미구현이다. Query Man 스킬 consumer 연계는 별도 저장소에서 검증했다.
+현재 **0.3.0 로컬 CLI**에서 오프라인 검사, 실제 PostgreSQL 접속 검사, 제한된 인증서 발급·
+DB 인증 설정 적용·credential 전달·교체·복구를 제공한다. Python 3.12+와 uv로 설치하고
+모든 명령을 JSON으로 호출한다. 로컬 issuer는 `cryptography`를 사용한다.
+새 disposable DB에서 설치된 wheel의 발급→검증→교체→복구를 확인했다.
+기존 voc-db 사용 전환, Kubernetes, 운영 PKI·인증서 폐기·자동 갱신·CI는 남아 있다.
 원격 저장소는 [hc-hyun/query-passport](https://github.com/hc-hyun/query-passport)다.
-M3의 내부 발급·설정 적용·전달·복구 경로를 새 disposable DB에서 검증했다.
-공개 쓰기 CLI와 rotation·기존 DB 전환은 남아 있으며 [로컬 lifecycle](docs/local-lifecycle.md)에 경계를 정리했다.
 
-이 폴더에서 이어서 작업할 때는 [AGENTS.md](AGENTS.md)와
-[개발 계획의 첫 작업](docs/development-plan.md#바로-이어서-할-첫-작업)을 읽고 M3부터 시작한다.
-기존 호스트 작업물이나 DB를 먼저 옮기거나 수정할 필요는 없다.
+이어서 작업할 때는 [AGENTS.md](AGENTS.md), [개발 계획](docs/development-plan.md#바로-이어서-할-첫-작업),
+[로컬 lifecycle](docs/local-lifecycle.md)을 읽는다. 기존 DB·credential·백업·기록을 먼저 옮기거나
+삭제하지 않는다. Query Man 앱의 profile/source/인증 단위와 readiness 정책은 유지한다.
 
 ## 설치와 실행
 
@@ -36,6 +35,8 @@ uv run --locked query-passport --version
 ```
 
 live 검사 준비와 결과 해석은 [로컬 Docker executor](docs/local-executor.md)를 따른다.
+발급·변경·교체 명령은 별도의 operator v2 binding을 구성하고
+[prepare→issue→apply→deliver 예시](docs/local-lifecycle.md#cli-실행-예시)대로 호출한다.
 유효한 operator binding이 없으면 `verify`는 접속 전에 `AUTHORIZATION_REQUIRED`로 거절한다.
 
 독립 CLI 설치는 `uv tool install .`로 가능하다. 이후 `query-passport --help`도 JSON으로 반환한다.
@@ -98,8 +99,8 @@ Query Passport가 중단되어도 이미 준비된 인증서로 수행하는 Que
 
 ## 주요 산출물
 
-M1의 package·CLI·공개 입력 계약과 M2의 로컬 Docker 접속 검증·실제 인증 거부 테스트를 구현했다.
-아래 표에서 PKI·배포·복구는 후속 개발 대상이다.
+M1·M2 및 로컬 M3 발급·적용·전달·교체·복구 경로를 구현했다.
+아래 표에서 조직 PKI·Secret provider와 Kubernetes·폐기는 후속 개발 대상이다.
 
 | 산출물 | 필요한 결과 |
 |---|---|
@@ -130,8 +131,8 @@ Kubernetes가 내부적으로 제공하는 TLS/Secret 기능을 다시 구현하
 ## 기존 Query Man과의 관계
 
 현재 로컬 앱 저장소는 `../query-boy`이며 제품명은 Query Man이다. Admin은 bounded helper로
-오프라인 `inspect`·`plan`, DBA는 기존 Execute 범위에서 `verify`를 호출한다.
-consumer 연계 커밋은 `8d7e93b`이며 실제 disposable DB 호출까지 검증했다.
+오프라인 `inspect`·`plan`, DBA는 기존 Execute 범위에서 `verify`와 로컬 lifecycle 명령을 호출한다.
+consumer는 Passport 0.3.0·계약 major 1·필요 capability를 확인하고 계획 참조와 오류·복구 결과를 검증한다.
 앱 runtime의 profile·source·DB 인증 계약과 기존 자격 증명은 변경하지 않았다.
 
 보존해야 할 기존 계약은 다음 문서에 있다. 이 작업 폴더가 이동하면 상대 경로 대신 실제 Query Man

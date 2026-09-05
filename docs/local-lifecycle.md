@@ -1,12 +1,12 @@
 # 로컬 lifecycle 구현과 검증
 
-M3는 아직 구현 중이다. 이 문서는 내부 backend와 검증 경계를 설명한다.
-현재 공개 CLI 명령은 `capabilities`, `inspect`, `plan`, `verify`이며, 아래 내부 API를
-공개 쓰기 명령이나 완료된 운영 절차로 취급하지 않는다. Rotation과 실제 voc-db 전환도 남아 있다.
+0.3.0은 로컬 `prepare`, `issue`, `apply`, `deliver`, `rotate`, `rollback`, `status`를 제공한다.
+이 문서는 operator 설정과 실행·복구 경계를 설명한다. 기존 voc-db 사용 전환, Kubernetes 전달과
+인증서 폐기는 별도 검증·구현 대상이다.
 
 ## 구현 경로
 
-`local_lifecycle.prepare()`는 승인된 로컬 binding으로 대상과 설정을 조사하고, 기존 role과
+`prepare`는 승인된 로컬 binding으로 대상과 설정을 조사하고, 기존 role과
 PUBLIC의 실효 권한을 확인한다. 신규 확인 계정에 업무 객체 접근·schema 생성·TEMP 권한이
 생기면 계획을 거절한다. 기존 grant를 자동 revoke하거나 DB·source·view·table을 만들지 않는다.
 현재 backend는 PGDATA의 표준 HBA·ident·auto.conf 배치를 지원한다.
@@ -37,9 +37,104 @@ operation ID와 plan digest로 참조한다. 호출 때마다 요청·승인 범
 active pointer가 선택한 버전을 target lock 안에서 읽고, 그 실제 디렉터리만 runtime에 mount한다.
 CA private key나 복구 기록은 runtime에 전달하지 않는다.
 
+## Operator v2 준비
+
+[로컬 executor](local-executor.md)의 고정 OS 계정·binding 파일·대상 pinning 규칙을 그대로 적용한다.
+`binding_version`을 `2`로 설정하고 기존 v1 필드에 다음 두 object를 추가한다. 이 파일은 operator가
+기존 승인 범위로 작성하는 private 설정이며 공개 요청·CLI argument·환경변수에 넣지 않는다.
+
+| 필드 | 필요한 값 |
+|---|---|
+| `operations` | 허용한 `prepare`, `issue`, `apply`, `deliver`, `rotate`, `rollback`, `status`, `verify`의 부분집합 |
+| `credential_dir` | Passport가 소유할 새 전달 store 절대 경로. 기존 credential directory를 지정하지 않음 |
+| `admin.uid`, `admin.gid` | 대상 container에서 승인된 PostgreSQL OS 계정의 양의 UID/GID |
+| `admin.socket_directory` | `/var/run/postgresql` |
+| `admin.pgdata` | 대상의 실제 PGDATA 절대 경로. HBA·ident·auto.conf는 표준 PGDATA 배치 |
+| `admin.network_cidr` | pinning한 hostaddr를 포함하는 승인된 IPv4 network, `/16` 이상으로 제한 |
+| `admin.connection_limit` | 정수 `2` |
+| `lifecycle.authority_dir` | 외부 private `0700` CA directory. Git 밖에 위치 |
+| `lifecycle.authority_id` | 승인된 발급기관의 소문자 alias, 최대 63자 |
+| `lifecycle.generations_dir` | CA와 분리된 외부 private 발급 세대 경로 |
+| `lifecycle.server_ca_file` | 승인된 서버 CA bundle의 외부 일반 파일 경로 |
+| `lifecycle.lifetime_days` | 1–90일의 요청 수명 |
+| `lifecycle.allow_initialize_authority` | 새 로컬 CA 생성이 승인되었을 때만 `true`, 아니면 기존 관리 CA 필요 |
+| `lifecycle.allow_create_check_role` | 제한 확인 계정의 준비 범위는 `true` 필요 |
+
+CA·발급 세대·전달 store 경로는 서로 같거나 중첩될 수 없다. 서버 CA는 이 세 경로 밖에 둔다.
+Symlink·넓은 쓰기 권한·Git ancestor를 거절한다. 기존 비밀 파일을 찾아 복사하거나 비밀번호로
+접속해 설정을 우회하지 않는다. `prepare`의 `intent: provision`은 새 role이 없고 PUBLIC에서 업무 접근·CREATE·TEMP가
+상속되지 않는지 검사하며 불일치를 거절한다. 기존 role을 자동 인수하거나 권한을 revoke하지 않는다.
+
+`deliver`에는 `verify`, `rotate`에는 `issue`·`deliver`·`verify` 권한도 필요하다. 승인 갱신은
+동일 binding의 `expires_at`만 연장할 수 있다. 대상·경로·허용 operation·identity 변경은 기존
+계획을 무효화한다. 앱은 Passport의 active pointer를 읽지 않는다. 앱 mount/rollout이 필요한
+경우 별도 승인된 배포 절차에서 검증한 실제 bundle 디렉터리를 사용해야 한다.
+
+## CLI 실행 예시
+
+먼저 기존 Query Man validator로 확인한 공개 요청 `request.json`과 operator binding을 준비한다.
+아래는 해당 범위가 승인된 뒤 실행하는 예시이며, 저장하는 파일은 비밀 없는 요청과 정제된 응답이다.
+`prepare` 자체는 live 조회와 새 operation 기록을 만들고 DB·인증서 변경은 하지 않는다.
+
+```bash
+query-passport capabilities
+query-passport prepare --request request.json > prepared.json
+```
+
+`prepared.json`의 account·client DN·actions·preserves를 검토하고 반환된 참조를 같은 요청에 결합한다.
+다음 코드는 성공한 prepare만 후속 요청으로 변환하며 인증서·binding을 읽지 않는다.
+
+```bash
+python3 - <<'PY_REQUEST'
+import json
+from pathlib import Path
+request = json.loads(Path("request.json").read_text())
+prepared = json.loads(Path("prepared.json").read_text())
+assert prepared["status"] == "planned" and not prepared["errors"]
+request.pop("intent", None)
+request["operation"] = {
+    "id": prepared["result"]["operation_id"],
+    "plan_digest": prepared["result"]["plan_digest"],
+}
+Path("operation.json").write_text(json.dumps(request) + "\n")
+PY_REQUEST
+query-passport issue --request operation.json
+query-passport apply --request operation.json
+query-passport deliver --request operation.json
+query-passport verify --request request.json
+query-passport status --request operation.json
+```
+
+각 명령의 종료 코드와 JSON 결과를 확인한 뒤 다음 명령을 실행한다. `issue`·`apply` 성공은
+전달·인증 성공을 뜻하지 않는다. `deliver`는 새 프로세스에서의 실제 신규 연결과 거부 검증을
+완료한 뒤에만 전환한다. 실패 시 자동으로 다음 단계에 진입하지 말고 같은 참조로 `status`를 조회한다.
+
+갱신은 기본 요청에 `intent: rotate`를 넣은 별도 공개 `rotation-request.json`으로 prepare한 뒤,
+같은 변환 절차로 `rotation-operation.json`을 만들고 다음 명령으로 수행한다.
+
+```bash
+query-passport prepare --request rotation-request.json > prepared.json
+# 위 변환 코드에서 rotation-request.json과 rotation-operation.json을 사용한다.
+query-passport rotate --request rotation-operation.json
+query-passport rollback --request rotation-operation.json
+query-passport rollback --request operation.json
+```
+
+Rotation은 같은 CA·서버 trust·확인 identity를 유지하고 새 키/인증서를 만든다. DB role·HBA·CA
+설정을 다시 적용하지 않는다. 새 인증서 검증 실패 시 기존 active 버전이 유지된다. Rotation
+rollback은 직전 세대의 실제 인증을 다시 검증한 뒤 pointer만 복구하므로 만료·인증 실패 세대로
+되돌리지 않는다. 원본 DB 설정 rollback은 자식 rotation을 역순으로 복구한 뒤에만 가능하다.
+발급·전달 세대는 보존하며 rollback으로 종료한 operation의 전진 실행은 거절한다.
+
+같은 CA의 재발급은 이전 인증서를 폐기하지 않는다. CA 변경·CRL·기존 connection pool 종료·
+앱 배포 전환은 이 명령의 지원 범위가 아니다. 마지막 `rollback`은 Passport 소유 확인 계정을
+비활성화하고 설정을 복구하는 동작이므로 단순 상태 확인으로 실행하지 않는다.
+
 ## 기록·실패·복구
 
-실행 기록은 OS 계정의 `~/.local/state/query-passport/operations/`에 보관한다. Operation과
+실행 기록은 OS 계정의 `~/.local/state/query-passport-executor/operations/`에 보관한다.
+기존 인계·리뷰가 있는 `~/.local/state/query-passport/`는 읽거나 권한을 바꾸지 않는다. 공개 쓰기
+CLI 이전 내부 API의 기록을 자동 이전하거나 다른 경로로 fallback하지 않는다. Operation과
 server별 lock은 Passport 호출을 직렬화한다. 이 lock이 일반 DBA나 다른 도구의 실행까지
 막는다고 가정하지 않는다.
 
@@ -68,11 +163,18 @@ uv run --locked pytest -q
 uv run --locked ruff check .
 uv run --locked ruff format --check .
 uv run --locked mypy
-QUERY_PASSPORT_DOCKER_TESTS=1 uv run --locked pytest -q tests/test_m3_fixture.py tests/test_m3_integration.py --tb=short
+QUERY_PASSPORT_DOCKER_TESTS=1 uv run --locked pytest -q tests/test_m3_fixture.py tests/test_m3_integration.py tests/test_installed_lifecycle.py --tb=short
 ```
 
 Opt-in 검사는 새 내부 network·PostgreSQL·외부 `/var/tmp` PKI만 만들고 소유 label과 directory
 identity를 확인해 자신이 만든 fixture만 정리한다. 기존 voc-db·호스트 자격 증명·백업을 검사
 대상으로 선택하지 않는다. 실제 운영 자료를 이 fixture로 복사하지 않는다.
+
+Query Man 스킬 consumer까지 연결하는 검사는 명시한 checkout의 DBA helper를 사용한다.
+환경변수는 공개 코드 경로 선택용이며, 기본 테스트에서는 외부 저장소를 읽지 않고 건너뛴다.
+
+```bash
+QUERY_PASSPORT_DOCKER_TESTS=1 QUERY_PASSPORT_QUERY_MAN_REPO=/path/to/query-man uv run --locked pytest -q tests/test_skill_lifecycle.py --tb=short
+```
 
 검증 결과와 미완료 사항은 [개발 계획](development-plan.md#m3-진행-기록)에 기록한다.

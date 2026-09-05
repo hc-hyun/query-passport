@@ -63,7 +63,11 @@ class StateError(Exception):
 
 
 def state_directory() -> Path:
-    return Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".local/state/query-passport/operations"
+    # Public executor state is separate from pre-existing review/handoff files.
+    # Never migrate, repair permissions on, or fall back to another namespace.
+    return (
+        Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".local/state/query-passport-executor/operations"
+    )
 
 
 def _open_root() -> int:

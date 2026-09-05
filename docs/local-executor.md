@@ -1,6 +1,7 @@
 # 로컬 Docker executor
 
-0.2.0의 `verify`는 직접 연결하는 PostgreSQL 18/UTF8와 로컬 Docker daemon을 지원한다.
+0.3.0의 `verify`는 직접 연결하는 PostgreSQL 18/UTF8와 로컬 Docker daemon을 지원한다.
+기존 v1 binding을 유지하며, 발급·교체와 관리 버전 검증은 [로컬 lifecycle v2](local-lifecycle.md)를 따른다.
 `inspect`·`plan`은 계속 오프라인이며 `verify`의 성공이 앱/source readiness를 증명하지 않는다.
 이 backend는 Query Man 이미지의 Python/psycopg를 UID/GID 10001:10001로 실행한다.
 운영 PKI, Kubernetes, PgBouncer와 protected 실행 승인은 아직 지원하지 않는다.
@@ -34,7 +35,7 @@ protected 승인·immutable 증거를 대신하는 장치는 아니다. 공개 A
 | `binding_version` | 정수 `1` |
 | `allowed_uid` | 호출을 허용한 실제 OS UID |
 | `expires_at` | 승인 범위가 만료되는 UTC Unix 초(정수) |
-| `operations` | 현재는 `["verify"]`만 지원 |
+| `operations` | v1은 `["verify"]`만 지원 |
 | `request` | 승인된 공개 요청의 사본. 별도 source inventory 증거는 아님 |
 | `container_id` | 정확한 DB container ID 64자리 |
 | `container_started_at` | 해당 container의 `.State.StartedAt` |
@@ -79,8 +80,9 @@ worker는 원문 인증정보나 driver 오류를 출력하지 않는다. 고정
 [libpq 연결 옵션](https://www.postgresql.org/docs/18/libpq-connect.html)을 따른다.
 
 입력 대기는 5초, 입력 검증 후 live CLI는 60초, Docker worker 호출은 25초로 제한한다.
-worker의 DB 검사는 12초, worker 전체는 18초다. timeout 후 검사 container를 정리하며,
-정리 실패와 실제 남은 resource를 확인하면 `RECOVERY_REQUIRED`를 반환한다.
+worker의 DB 검사는 12초, worker 전체는 18초다. timeout 후 검사 container를 정리한다.
+원래 timeout·중단 결과는 정리 실패에도 유지하며 lifecycle에서는 `unknown`으로 기록한다.
+그 외 정리 실패와 실제 남은 resource를 확인하면 `RECOVERY_REQUIRED`를 반환한다.
 
 ## 결과와 오류
 
