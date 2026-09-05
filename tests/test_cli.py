@@ -199,7 +199,7 @@ def test_file_reader_only_opens_explicit_public_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "open", recording_open)
     assert cli.read_request("request.json", str(tmp_path)) == REQUEST_BYTES
-    assert opened == [str(tmp_path), "request.json"]
+    assert opened == [tmp_path.anchor, *tmp_path.parts[1:], "request.json"]
 
 
 def test_unexpected_exception_is_redacted(monkeypatch, capfd):

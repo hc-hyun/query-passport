@@ -133,6 +133,10 @@ Mypy 소스 4개 파일 통과, wheel/sdist 빌드 통과. 별도 임시 virtual
 workspace 문서 링크 24개를 확인했다. 기존 외부 저장소 참조 6개는 접근하지 않았다.
 산출물 버전은 0.1.0이며 이 M1 검증 당시에는 Git 미초기화 상태라 commit revision이 없었다.
 
+M1 사용 점검 후 workspace 경로 전체의 symlink 거절과 닫힌 stdout의 traceback 비노출을
+보완했다. 실제 FD 1 폐쇄, 중간/trailing-slash symlink와 경로 교체 회귀를 포함해
+169개 테스트, lint·format·타입 검사와 빌드를 통과했다. 기존 외부 점검 기록은 보존했다.
+
 테스트는 root `tests/`에 있으며 schema·필수값·이름·port·version·금지 필드·source 0개,
 미지원 명령/capability, JSON 크기·중첩·중복 key·UTF-8, symlink/hardlink/FIFO·workspace 경계,
 입력값·예외 비노출, 네트워크·credential 미접근, stdin timeout과 출력 제한을 검증한다.

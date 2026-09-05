@@ -30,6 +30,30 @@ class Parser(argparse.ArgumentParser):
         raise ContractError()
 
 
+def open_directory(path: str) -> int:
+    """Open each directory component without following symlinks; caller closes FD.
+
+    Preserve ``..`` components during the walk so a preceding symlink cannot be
+    hidden by lexical normalization. Directory descriptors keep later opens tied
+    to the directories already checked even if their names are replaced.
+    """
+    if not path:
+        raise ValueError("Empty directory path")
+    parsed = Path(path)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory = os.open(parsed.anchor or ".", flags)
+    try:
+        parts = parsed.parts[1:] if parsed.anchor else parsed.parts
+        for part in parts:
+            child = os.open(part, flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        return directory
+    except BaseException:
+        os.close(directory)
+        raise
+
+
 def read_request(filename: str, workspace: str) -> bytes:
     if filename == "-":
         return sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
@@ -57,7 +81,7 @@ def read_request(filename: str, workspace: str) -> bytes:
     directory = -1
     descriptor = -1
     try:
-        directory = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory = open_directory(workspace)
         for part in path.parts[:-1]:
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
             os.close(directory)
@@ -143,7 +167,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         output = json.dumps(envelope(command, "failed", {}, code="OUTPUT_TOO_LARGE")) + "\n"
     try:
         # One bounded write. No diagnostics, tracebacks, or user strings on stderr.
+        if sys.stdout is None:
+            return 1
         os.write(sys.stdout.fileno(), output.encode())
-    except OSError:
+    except (OSError, ValueError, AttributeError):
         return 1
     return exit_code
