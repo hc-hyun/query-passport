@@ -1,0 +1,17 @@
+{
+  "contract_version": "1",
+  "profile_version": 1,
+  "scope": "database-only",
+  "environment": "local-synthetic",
+  "deployment_alias": "query-man-local",
+  "target_alias": "synthetic-db-check",
+  "profile": {
+    "id": "example-db",
+    "host": "db.example.test",
+    "port": 5432,
+    "database": "query_man",
+    "sslmode": "verify-full",
+    "authentication": {"type": "client-certificate"}
+  },
+  "source_count": 0
+}

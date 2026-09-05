@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "query-passport"
+version = "0.1.0"
+description = "Offline input inspection and planning for Query Man"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+query-passport = "query_passport.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1", "mypy>=1.15,<2", "jsonschema>=4.23,<5"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+include = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "BLE001", "PLW1510"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]

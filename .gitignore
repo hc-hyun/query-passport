@@ -1,0 +1,22 @@
+# Runtime credentials and environment-specific operational artifacts stay outside Git.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+/.state/
+/artifacts/
+/credentials/
+/authority/
+/probes/
+/local/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
