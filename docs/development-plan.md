@@ -170,3 +170,10 @@ M2부터 bounded integration, M3부터 failure/recovery, M4부터 container/Pod 
 integration 23개를 통과했다.
 정확한 실행 명령은 [로컬 executor 검증](local-executor.md#disposable-검증)에 있다.
 기존 voc-db나 기존 인증서에는 접근·변경하지 않았고 아직 사용 전환 완료를 주장하지 않는다.
+
+## M3 진행 기록
+
+HBA/ident의 소유 block만 생성·비교·복구하는 순수 helper를 구현하고 125개 테스트로 검증했다.
+기존 block 교체에는 원문 digest 일치가 필요하며, 복구는 다른 작업의 변경을 보존한다.
+이 helper만으로 DB 파일 쓰기·reload·NOLOGIN·PKI 발급·전달·실패복구를 완료했다고 판단하지 않는다.
+실제 lifecycle executor와 disposable E2E는 다음 구현 대상이다.
