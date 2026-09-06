@@ -1,0 +1,63 @@
+{
+  "binding_version": 2,
+  "allowed_uid": 1000,
+  "expires_at": 0,
+  "operations": [
+    "verify",
+    "prepare",
+    "issue",
+    "apply",
+    "deliver",
+    "rotate",
+    "status"
+  ],
+  "request": {
+    "contract_version": "1",
+    "profile_version": 1,
+    "scope": "database-only",
+    "environment": "local-synthetic",
+    "deployment_alias": "query-man-local",
+    "target_alias": "synthetic-db-check",
+    "profile": {
+      "id": "example-db",
+      "host": "db.example.test",
+      "port": 5432,
+      "database": "query_man",
+      "sslmode": "verify-full",
+      "authentication": {
+        "type": "client-certificate"
+      }
+    },
+    "source_count": 0
+  },
+  "container_id": "0000000000000000000000000000000000000000000000000000000000000000",
+  "container_started_at": "2000-01-01T00:00:00.000000000Z",
+  "database_image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "network_name": "example-network",
+  "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
+  "hostaddr": "192.0.2.2",
+  "runtime_image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "runtime_uid": 10001,
+  "runtime_gid": 10001,
+  "username": "passport_check",
+  "expected_dn": "CN=example-client",
+  "credential_dir": "/srv/example-passport/delivery",
+  "admin": {
+    "uid": 999,
+    "gid": 999,
+    "username": "postgres",
+    "socket_directory": "/var/run/postgresql",
+    "pgdata": "/var/lib/postgresql/data",
+    "network_cidr": "192.0.2.0/24",
+    "connection_limit": 2
+  },
+  "lifecycle": {
+    "authority_dir": "/srv/example-passport/authority",
+    "authority_id": "example-ca",
+    "generations_dir": "/srv/example-passport/generations",
+    "server_ca_file": "/srv/example-passport/server-ca.crt",
+    "lifetime_days": 90,
+    "allow_initialize_authority": true,
+    "allow_create_check_role": true
+  }
+}

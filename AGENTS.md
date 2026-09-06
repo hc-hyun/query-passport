@@ -2,7 +2,7 @@
 
 이 지침은 이 프로젝트 전체에 적용한다. Query Passport는 Query Man 스킬이 호출하는 DB 인증서와
 접속 준비 도구다. 현재 M1 오프라인 CLI, M2 로컬 Docker 검증과 M3 로컬 발급·적용·전달·교체 MVP CLI를 구현했다.
-기존 대상 전환과 Kubernetes·운영 PKI 연계는 별도 검증·개발 대상이다.
+로컬 voc-db 전환과 스킬 연계 검증을 완료했다. 앱·Pod 연결 검증과 Kubernetes·운영 PKI 연계는 별도 대상이다.
 
 ## 작업 시작
 

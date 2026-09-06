@@ -1,6 +1,6 @@
 # 개발 계획
 
-Status: 0.4.0 MVP 단순화 / 기존 DB 전환과 Query Man consumer 갱신 미완료
+Status: 0.4.0 MVP·Query Man consumer 대응·로컬 voc-db 전환 완료 / 앱·Pod 연결 검증은 실제 사용 시 진행
 
 ## 현재 범위
 
@@ -57,7 +57,7 @@ QUERY_PASSPORT_DOCKER_TESTS=1 uv run --locked pytest -q --tb=short
 - 문서의 로컬 링크·내부 anchor와 JSON 예시 일치 확인.
 
 이번 단순화에서 기존 DB·호스트 credential·Query Man 저장소는 변경하지 않았다.
-삭제한 0.3.0 consumer E2E는 0.4.0 호환성 검증을 대신하지 않으며 consumer 갱신은 아래 후속 작업이다.
+이 시점에는 삭제한 0.3.0 consumer E2E를 대체할 0.4.0 연계 검증이 남아 있었다. 이후 결과는 아래에 기록한다.
 
 ## 2026-09-06 E2E 검증
 
@@ -74,10 +74,28 @@ Git bundle, 미커밋 코드 스냅샷, 실제 테스트 wheel, JSON 실행 이�
 복원 안내를 저장소 밖의 전용 폴더에 보존했다. Git clone 및 코드 스냅샷 추출 복원을 검증했고,
 wheel의 Python source 17개가 스냅샷과 일치함을 확인했다. 기존 DB·호스트 인증서는 변경하지 않았다.
 
+## 2026-09-06 Query Man 연계와 실제 DB 전환
+
+환경에 보존된 `voc-db-v04-20260906` 점검 기록과 운영 인계를 확인했다.
+Query Man 호출부는 0.4.0·v2 live capability·7개 검사·새 오류 계약에 대응하고 rollback 호출을 제거했다.
+스킬→설치 CLI→실제 voc-db의 발급·DB 적용·전달·갱신·재검증을 완료했다.
+공통 호출부 변경 7개 파일은 Query Man `homework`의 `105520b`에 커밋했다.
+이전 확인 계정은 운영자가 NOLOGIN으로 전환했고 기존 파일은 별도 보관했다.
+이는 Passport가 rollback·기존 계정 퇴역·PKI 폐기를 구현했다는 뜻이 아니다.
+
+기록된 검증은 Query Man 764 passed / DB lane 11 deselected, Passport 기본 1,066 passed,
+별도 Docker 통합 41 passed, 실제 DB 연결 검사 7개 모두 passed다.
+Source는 0개이며 앱·Pod mount, 앱 새 연결, source/reader·application readiness는 미검증이다.
+실제 경로·작업 ID·만료일·인증서와 전환 자료는 환경 기록에 보존하며 이 저장소로 복사하지 않는다.
+
+커밋 전 Query Man Ruff·mypy를 다시 확인했고 전체 테스트 **764 passed / 11 deselected**를 확인했다.
+실제 0.4.0 CLI의 capabilities를 공통 helper로 읽는 smoke도 통과했다.
+Passport 변경은 문서와 비활성 합성 binding 예시뿐이다. 예시의 오프라인 검증·문서 링크/anchor·JSON
+예시 일치를 확인했으며, 이 문서 마무리 작업에서 실제 DB 변경이나 E2E 재실행은 하지 않았다.
+
 ## 바로 이어서 할 첫 작업
 
-1. Query Man consumer를 0.4.0의 v2 live capability와 오류 계약에 맞춘다. 현재 외부 저장소는 변경하지 않는다.
-2. 기존 DB 전환 필요 시 새 경로·대상을 고정하고 별도 검증한다. 현재 전환은 중단 상태다.
-
-Kubernetes, 운영 PKI, 폐기, 자동 갱신 스케줄러와 장애 복구 자동화는 MVP 범위에서 제외한다.
-기존 voc-db·호스트 credential·백업·기록을 이 작업에서 변경하거나 이관하지 않는다.
+필수 기능 추가는 없다. [짧은 사용 안내](quickstart.md)로 설치·operator 설정·발급·갱신·오류·만료를 확인한다.
+실제로 앱에서 사용할 때 새 세대 mount와 앱 새 연결, 필요한 source/reader·readiness를 검증한다.
+CI·자동 갱신·알림·추가 복구 기능은 현재 필수 범위에 넣지 않는다.
+Kubernetes·운영 PKI·폐기는 실제 환경 요구가 생길 때 별도 범위로 진행한다.

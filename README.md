@@ -19,7 +19,10 @@ Query Man 스킬이 호출하는 PostgreSQL 인증서 준비 CLI다. Python 3.12
 
 `inspect`·`plan`은 DB·Docker·PKI에 접근하지 않는다. `plan`은 항상 `executable: false`다.
 Source 0개는 정상이며 DB 연결 성공도 source/reader/application readiness 성공을 뜻하지 않는다.
-로컬 PostgreSQL 18/UTF8·Docker를 지원한다. 기존 voc-db 전환, Kubernetes, 운영 PKI·폐기는 미완료다.
+로컬 PostgreSQL 18/UTF8·Docker를 지원한다. 로컬 voc-db 전환과 Query Man 스킬 연계 검증은 완료했다.
+앱·Pod 인증서 mount/새 연결 검증, Kubernetes 전달, 운영 PKI·폐기는 미완료다.
+
+가끔 사용할 때는 [설치·설정·발급·갱신·오류 대응 안내](docs/quickstart.md)를 먼저 읽는다.
 
 ## 설치와 실행
 
@@ -52,5 +55,6 @@ uv build
 - [기존 작업 인계](docs/local-handoff.md): 과거 작업 참고 자료
 
 0.4.0은 0.3.0의 복구 계약을 제거한 변경이다. Live capability는 v2이고 `rollback`은 지원하지 않는다.
-기존 0.3.0 Query Man consumer와의 호환성 갱신은 별도 작업이다. 기존 작업 기록이나 credential store를
+Query Man consumer의 0.4.0 대응과 스킬→실제 DB 검증을 완료했다. 사용 시 대응 commit이 포함된
+Query Man checkout을 사용한다. 기존 작업 기록이나 credential store를
 자동 변환하지 않는다. 이전 전달 store는 소유 형식 오류로 거절하며 새 전용 경로를 사용한다.
