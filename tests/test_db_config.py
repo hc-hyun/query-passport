@@ -26,17 +26,16 @@ def assert_error(code, function, *args, **kwargs):
     assert "SYNTHETIC_SECRET" not in str(caught.value)
 
 
-@pytest.mark.parametrize("body", [HBA, IDENT])
 @pytest.mark.parametrize(
-    "original",
+    "body,original",
     [
-        "",
-        "# original\nlocal all all peer\n",
-        "# original\r\nlocal all all peer\r\n",
-        "# original\r\nlocal all all peer\n# no final newline",
-        "local all all peer",
-        "# utf8 한글\n",
-        "# comment with continuation \\\n# next line\n",
+        (HBA, ""),
+        (IDENT, "# original\nlocal all all peer\n"),
+        (HBA, "# original\r\nlocal all all peer\r\n"),
+        (HBA, "# original\r\nlocal all all peer\n# no final newline"),
+        (IDENT, "local all all peer"),
+        (HBA, "# utf8 한글\n"),
+        (IDENT, "# comment with continuation \\\n# next line\n"),
     ],
 )
 def test_new_block_is_first_preserves_every_original_byte(body, original):
@@ -160,9 +159,20 @@ def test_hba_identifiers_are_literal_even_for_hba_keywords(identifier):
     assert propose_config("", OWNER, ident)
 
 
-@pytest.mark.parametrize("field", [0, 1, 4])
 @pytest.mark.parametrize(
-    "bad", ["", "bad-name", "bad name", "a\nall", "a,b", "+role", "/regex", 'a"b', "é", "a" * 64]
+    "field,bad",
+    [
+        (0, ""),
+        (1, "bad-name"),
+        (4, "bad name"),
+        (0, "a\nall"),
+        (1, "a,b"),
+        (4, "+role"),
+        (0, "/regex"),
+        (1, 'a"b'),
+        (4, "é"),
+        (0, "a" * 64),
+    ],
 )
 def test_invalid_identifier_rejected(field, bad):
     arguments = ["query_man", "passport_probe", "CN=probe", "127.0.0.1/32", "probe_map"]

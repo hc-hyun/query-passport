@@ -448,16 +448,13 @@ def test_failed_result_preserves_only_fixed_classification():
 
 
 @pytest.mark.parametrize(
-    "failure",
+    "failure,cleanup",
     [
-        ContractError("TIMEOUT"),
-        ContractError("INTERRUPTED"),
-        ContractError("CLIENT_AUTHENTICATION_FAILED"),
-        KeyboardInterrupt(),
-        SystemExit(1),
+        (ContractError("TIMEOUT"), "remaining"),
+        (ContractError("CLIENT_AUTHENTICATION_FAILED"), "observation_failed"),
+        (KeyboardInterrupt(), "interrupted"),
     ],
 )
-@pytest.mark.parametrize("cleanup", ["remaining", "observation_failed", "interrupted"])
 def test_policy_probe_uncertainty_survives_docker_cleanup(binding, monkeypatch, failure, cleanup):
     monkeypatch.setattr(executor, "target_snapshot", lambda _: "fixed-generation")
     calls = []

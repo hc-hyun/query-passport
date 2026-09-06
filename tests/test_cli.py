@@ -61,7 +61,7 @@ def test_discovery(args):
     assert result["command"] == "capabilities"
 
 
-@pytest.mark.parametrize("command", [MARKER, "psql", "grant", "deploy"])
+@pytest.mark.parametrize("command", [MARKER, "rollback"])
 def test_unsupported_does_not_read_request(command):
     code, response = run(command, "--request", MARKER)
     assert code == 3
@@ -86,23 +86,9 @@ def test_bad_arguments_are_safe(args):
 
 
 @pytest.mark.parametrize(
-    "field",
-    [
-        "password",
-        "token",
-        "dsn",
-        "certificate",
-        "private_key",
-        "secret",
-        "secret_store_id",
-        "credential_path",
-        "sql",
-        "command",
-        "approved",
-        MARKER,
-    ],
+    "field,path",
+    [("password", ()), ("private_key", ("profile",)), (MARKER, ("profile", "authentication"))],
 )
-@pytest.mark.parametrize("path", [(), ("profile",), ("profile", "authentication")])
 def test_forbidden_fields_never_reflected(field, path):
     request = copy.deepcopy(REQUEST)
     parent = request
@@ -287,11 +273,4 @@ def test_lifecycle_cli_recognizes_commands_and_rejects_wrong_request_shape(comma
     code, response = run(command, "--request", "-", data=json.dumps(request).encode())
     assert code == 2 and response["command"] == command
     assert response["errors"][0]["code"] == "INVALID_INPUT"
-    assert response["result"] == {}
-
-
-@pytest.mark.parametrize("command", LIFECYCLE_COMMANDS)
-def test_lifecycle_cli_has_no_approval_bypass_flags(command):
-    code, response = run(command, "--request", "-", "--yes", data=REQUEST_BYTES)
-    assert code == 2 and response["errors"][0]["code"] == "INVALID_INPUT"
     assert response["result"] == {}

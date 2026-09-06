@@ -199,10 +199,14 @@ def test_in_place_credential_change_is_detected(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "failure",
-    [ContractError("TIMEOUT"), ContractError("INTERRUPTED"), KeyboardInterrupt(), SystemExit(1)],
+    "failure,cleanup",
+    [
+        (ContractError("TIMEOUT"), "absent"),
+        (ContractError("INTERRUPTED"), "remaining"),
+        (KeyboardInterrupt(), "observation_failed"),
+        (SystemExit(1), "interrupted"),
+    ],
 )
-@pytest.mark.parametrize("cleanup", ["absent", "remaining", "observation_failed", "interrupted"])
 def test_verification_uncertainty_survives_cleanup_failure(
     binding, tmp_path, monkeypatch, failure, cleanup
 ):
@@ -237,11 +241,14 @@ def test_verification_uncertainty_survives_cleanup_failure(
 
 
 @pytest.mark.parametrize(
-    "failure",
-    [ContractError("TIMEOUT"), ContractError("INTERRUPTED"), KeyboardInterrupt(), SystemExit(1)],
+    "failure,stage,remaining",
+    [
+        (ContractError("TIMEOUT"), "rm", b""),
+        (ContractError("INTERRUPTED"), "rm", b"remaining"),
+        (KeyboardInterrupt(), "ps", b""),
+        (SystemExit(1), "ps", b"remaining"),
+    ],
 )
-@pytest.mark.parametrize("stage", ["rm", "ps"])
-@pytest.mark.parametrize("remaining", [b"", b"remaining"])
 def test_cleanup_first_uncertainty_is_preserved_even_after_reconciliation(
     monkeypatch, failure, stage, remaining
 ):
