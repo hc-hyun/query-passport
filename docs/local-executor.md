@@ -1,6 +1,6 @@
 # 로컬 Docker executor
 
-0.3.0의 `verify`는 직접 연결하는 PostgreSQL 18/UTF8와 로컬 Docker daemon을 지원한다.
+0.4.0의 `verify`는 직접 연결하는 PostgreSQL 18/UTF8와 로컬 Docker daemon을 지원한다.
 기존 v1 binding을 유지하며, 발급·교체와 관리 버전 검증은 [로컬 lifecycle v2](local-lifecycle.md)를 따른다.
 `inspect`·`plan`은 계속 오프라인이며 `verify`의 성공이 앱/source readiness를 증명하지 않는다.
 이 backend는 Query Man 이미지의 Python/psycopg를 UID/GID 10001:10001로 실행한다.
@@ -16,7 +16,7 @@ uv run --locked query-passport verify --request examples/request.json
 
 예시 alias에 binding을 구성하지 않은 상태에서 마지막 명령은 exit 6 /
 `AUTHORIZATION_REQUIRED`다. 호스트명·alias·`approved: true`만으로 접속 권한을 만들 수 없다.
-스킬은 `connection.verify.v1`과 계약 major 1을 확인한 뒤 이미 승인된 실행 범위에서만 호출한다.
+스킬은 `connection.verify.v2`과 계약 major 1을 확인한 뒤 이미 승인된 실행 범위에서만 호출한다.
 
 ## Operator binding
 
@@ -70,19 +70,16 @@ worker는 원문 인증정보나 driver 오류를 출력하지 않는다. 고정
 
 - 실제 TLS 1.2/1.3, 서버 CA·hostname, 정확한 client DN, DB·session_user·endpoint
 - PostgreSQL 18, server/client UTF8, UTC·repeatable-read·read-only transaction
-- statement timeout 뒤 rollback 및 같은 연결 복구
-- 명시적 안전한 cancel 뒤 rollback 및 같은 연결 복구, 순차 신규 연결 재검증
 - 실제 UID/GID, 파일 권한과 read-only mount
 
 연결은 동시에 하나만 사용한다. password·pgpass·GSS·약한 TLS로 실패를 우회하지 않는다.
-지원되는 psycopg는 3.2 이상, libpq는 안전한 취소를 지원하는 17 이상이어야 한다.
-[Psycopg cancel_safe](https://www.psycopg.org/psycopg3/docs/api/connections.html#psycopg.Connection.cancel_safe),
+지원되는 psycopg는 3.2 이상, libpq는 client certificate 옵션을 지원하는 17 이상이어야 한다.
 [libpq 연결 옵션](https://www.postgresql.org/docs/18/libpq-connect.html)을 따른다.
 
 입력 대기는 5초, 입력 검증 후 live CLI는 60초, Docker worker 호출은 25초로 제한한다.
 worker의 DB 검사는 12초, worker 전체는 18초다. timeout 후 검사 container를 정리한다.
-원래 timeout·중단 결과는 정리 실패에도 유지하며 lifecycle에서는 `unknown`으로 기록한다.
-그 외 정리 실패와 실제 남은 resource를 확인하면 `RECOVERY_REQUIRED`를 반환한다.
+원래 timeout·중단 결과는 정리 실패에도 유지한다. 고의 timeout/cancel 복구 진단은 실행하지 않는다.
+그 외 정리 실패와 실제 남은 resource를 확인하면 `EXECUTOR_CLEANUP_FAILED`를 반환한다.
 
 ## 결과와 오류
 
@@ -96,7 +93,7 @@ worker의 DB 검사는 12초, worker 전체는 18초다. timeout 후 검사 cont
 | 6 | `AUTHORIZATION_REQUIRED` |
 | 7 | `TARGET_MISMATCH`, `TARGET_DRIFT` |
 | 8 | `EXECUTOR_FAILED`, `CREDENTIAL_ACCESS_DENIED`, `TLS_VERIFICATION_FAILED`, `CLIENT_AUTHENTICATION_FAILED`, `PERMISSION_DENIED`, `CONNECTION_FAILED`, `VERIFICATION_FAILED` |
-| 9 | `RECOVERY_REQUIRED` |
+| 9 | `EXECUTOR_CLEANUP_FAILED` |
 
 timeout은 기존 exit 5다. worker가 실행되었다면 실패 시에도 각 검사의 passed/failed/not_checked를
 반환한다. 접속 전 거절 또는 executor 자체의 실패는 빈 result를 반환한다. raw stderr, 내부 경로,
@@ -112,5 +109,5 @@ timeout은 기존 exit 5다. worker가 실행되었다면 실패 시에도 각 �
 QUERY_PASSPORT_DOCKER_TESTS=1 uv run --locked pytest -q tests/test_live_integration.py
 ```
 
-부정 검사는 별도 합성 credential과 격리 환경에서만 수행한다. 실제 설정 복구·발급·교체와
-기존 voc-db 사용 전환은 M3 및 전환 검증의 완료 기준으로 별도 관리한다.
+부정 검사는 별도 합성 credential과 격리 환경에서만 수행한다. 발급·교체는
+[로컬 lifecycle](local-lifecycle.md)을 따른다. 기존 voc-db 사용 전환은 별도 작업이다.

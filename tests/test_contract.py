@@ -159,18 +159,17 @@ def test_capabilities_are_only_implemented():
         "apply",
         "deliver",
         "rotate",
-        "rollback",
         "status",
     ]
     assert result["capabilities"] == [
         "profile.inspect.v1",
         "plan.offline.v1",
-        "connection.verify.v1",
-        "lifecycle.local.v1",
-        "credential.rotate.local.v1",
+        "connection.verify.v2",
+        "lifecycle.local.v2",
+        "credential.rotate.local.v2",
     ]
     assert result["backend_types"] == ["offline", "local-docker"]
-    assert result["policy_revision"] == "m3-local-lifecycle-1"
+    assert result["policy_revision"] == "mvp-local-lifecycle-2"
     assert result["limits"]["lifecycle_timeout_seconds"] == 180
 
 
@@ -191,7 +190,7 @@ def test_supported_capabilities_and_protected_context(request_data):
     request_data["required_capabilities"] = [
         "profile.inspect.v1",
         "plan.offline.v1",
-        "connection.verify.v1",
+        "connection.verify.v2",
     ]
     jsonschema.validate(request_data, SCHEMA)
     result = respond("plan", request_data)["result"]

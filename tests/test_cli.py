@@ -41,7 +41,7 @@ def run(*args, data=None, cwd=ROOT):
         "errors",
     }
     assert response["contract_version"] == "1"
-    assert response["tool_version"] == "0.3.0"
+    assert response["tool_version"] == "0.4.0"
     assert MARKER.encode() not in completed.stdout
     return completed.returncode, response
 

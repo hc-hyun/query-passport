@@ -52,7 +52,7 @@ def rotation(binding):
     return lifecycle.prepare(REQUEST, binding, intent="rotate")
 
 
-def test_rotation_uses_new_generation_and_rollback_preserves_database(rotating, binding):
+def test_rotation_uses_new_generation_without_changing_database(rotating, binding):
     backends, initial, revisions = rotating
     prepared = rotation(binding)
     assert prepared["intent"] == "rotate"
@@ -68,45 +68,7 @@ def test_rotation_uses_new_generation_and_rollback_preserves_database(rotating, 
     assert provision.execute("rotate", binding, prepared)["phase"] == "verified"
     assert backends.db.apply.call_count == before_apply_calls
     backends.db.rollback.assert_not_called()
-    assert provision.execute("rollback", binding, prepared)["phase"] == "rolled_back"
-    assert backends.state.active == initial["operation_id"]
-    assert provision.execute("rollback", binding, prepared)["phase"] == "rolled_back"
-    backends.db.rollback.assert_not_called()
-    assert set(revisions) == {initial["operation_id"], prepared["operation_id"]}
-    assert provision.execute("status", binding, prepared)["db_connectivity"] == "not_checked"
-
-
-def test_older_operation_cannot_disable_newer_active_identity(rotating, binding):
-    backends, initial, _ = rotating
-    child = rotation(binding)
-    provision.execute("rotate", binding, child)
-    initial_events = provision.events(initial)
-    with pytest.raises(ContractError) as error:
-        provision.execute("rollback", binding, initial)
-    assert error.value.code == "TARGET_DRIFT"
-    assert provision.events(initial) == initial_events
-    backends.db.rollback.assert_not_called()
-    assert backends.state.active == child["operation_id"]
-    provision.execute("rollback", binding, child)
-    provision.execute("rollback", binding, initial)
-    assert backends.state.active is None
-
-
-def test_rotation_chain_reverts_in_order_and_retains_owner(rotating, binding):
-    backends, initial, _ = rotating
-    first = rotation(binding)
-    provision.execute("rotate", binding, first)
-    second = rotation(binding)
-    provision.execute("rotate", binding, second)
-    with pytest.raises(ContractError) as error:
-        provision.execute("rollback", binding, first)
-    assert error.value.code == "TARGET_DRIFT"
-    assert provision.events(first)[-1]["phase"] == "verified"
-    provision.execute("rollback", binding, second)
-    assert backends.state.active == first["operation_id"]
-    provision.execute("rollback", binding, first)
-    assert backends.state.active == initial["operation_id"]
-    backends.db.rollback.assert_not_called()
+    assert backends.state.active == prepared["operation_id"]
 
 
 def test_parallel_rotation_plans_cannot_replace_a_newer_revision(rotating, binding):
@@ -143,7 +105,6 @@ def test_rotation_never_changes_trust_implicitly(rotating, binding, field):
         provision.execute("rotate", binding, prepared)
     assert error.value.code == "TARGET_DRIFT"
     assert backends.state.active == initial["operation_id"]
-    assert provision.execute("rollback", binding, prepared)["phase"] == "rolled_back"
     backends.db.rollback.assert_not_called()
 
 
@@ -160,20 +121,6 @@ def test_failed_new_client_does_not_switch_previous_active_generation(rotating, 
     assert backends.state.active == prepared["operation_id"]
 
 
-def test_unusable_previous_certificate_is_not_restored(rotating, binding):
-    backends, _, _ = rotating
-    prepared = rotation(binding)
-    provision.execute("rotate", binding, prepared)
-    before_rollback = backends.delivery.rollback.call_count
-    backends.verify.return_value = {"status": "failed", "error": "CLIENT_AUTHENTICATION_FAILED"}
-    with pytest.raises(ContractError) as error:
-        provision.execute("rollback", binding, prepared)
-    assert error.value.code == "CLIENT_AUTHENTICATION_FAILED"
-    assert backends.delivery.rollback.call_count == before_rollback
-    assert backends.state.active == prepared["operation_id"]
-    backends.db.rollback.assert_not_called()
-
-
 @pytest.mark.parametrize("command", ["issue", "apply", "deliver"])
 def test_rotation_plan_cannot_authorize_database_mutation_commands(rotating, binding, command):
     backends, _, _ = rotating
@@ -185,22 +132,12 @@ def test_rotation_plan_cannot_authorize_database_mutation_commands(rotating, bin
     assert backends.db.apply.call_count == before_apply
 
 
-def test_rolled_back_rotation_is_retired(rotating, binding):
-    _, _, _ = rotating
-    prepared = rotation(binding)
-    provision.execute("rotate", binding, prepared)
-    provision.execute("rollback", binding, prepared)
-    with pytest.raises(ContractError) as error:
-        provision.execute("rotate", binding, prepared)
-    assert error.value.code == "RECOVERY_REQUIRED"
-
-
-def test_rotation_timeout_is_unknown_and_preserves_previous_generation(rotating, binding):
+def test_rotation_timeout_preserves_previous_generation(rotating, binding):
     backends, initial, _ = rotating
     prepared = rotation(binding)
     backends.permissions.side_effect = ContractError("TIMEOUT")
     with pytest.raises(ContractError) as error:
         provision.execute("rotate", binding, prepared)
     assert error.value.code == "TIMEOUT"
-    assert provision.events(prepared)[-1]["phase"] == "unknown"
+    assert provision.events(prepared)[-1]["phase"] == "delivering"
     assert backends.state.active == initial["operation_id"]

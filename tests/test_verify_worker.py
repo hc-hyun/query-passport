@@ -376,15 +376,6 @@ def test_sanitize_environment_removes_hidden_driver_options(
     assert not any(value == "secret-canary" for value in os.environ.values())
 
 
-def test_timeout_and_cancellation_are_not_confused() -> None:
-    timeout = DriverError("canceling statement due to statement timeout", "57014")
-    canceled = DriverError("canceling statement due to user request", "57014")
-    assert worker._expected_cancel(timeout, "canceling statement due to statement timeout")
-    assert worker._expected_cancel(canceled, "canceling statement due to user request")
-    assert not worker._expected_cancel(timeout, "canceling statement due to user request")
-    assert not worker._expected_cancel(canceled, "canceling statement due to statement timeout")
-
-
 @pytest.mark.parametrize(
     ("row", "expected_check"),
     [
@@ -460,7 +451,7 @@ def test_transaction_enforces_read_only_repeatable_read_and_utc(
         asyncio.run(worker._transaction_check(object()))
 
 
-def test_requires_safe_libpq_cancellation_before_connecting(
+def test_requires_supported_libpq_before_connecting(
     worker_request: worker.Request, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     connect = AsyncMock()
@@ -503,58 +494,8 @@ def test_provider_diagnostic_failure_still_has_fixed_result() -> None:
     assert "secret-canary" not in json.dumps(result)
 
 
-@pytest.mark.parametrize(
-    "actual_reason",
-    [
-        "canceling statement due to user request",
-        "canceling statement due to statement timeout",
-        None,
-    ],
-)
-def test_explicit_cancel_requires_observed_user_cancellation_and_recovers(
-    monkeypatch: pytest.MonkeyPatch, actual_reason: str | None
-) -> None:
-    async def scenario() -> None:
-        signal_received = asyncio.Event()
-        connection = SimpleNamespace(
-            pgconn=SimpleNamespace(transaction_status=2),
-            rollback=AsyncMock(),
-        )
-
-        async def cancel_safe(*, timeout: float) -> None:
-            assert timeout == 1.0
-            signal_received.set()
-
-        connection.cancel_safe = AsyncMock(side_effect=cancel_safe)
-
-        async def row(_connection: object, sql: str) -> object:
-            if "pg_sleep" in sql:
-                connection.pgconn.transaction_status = 1
-                await signal_received.wait()
-                if actual_reason is not None:
-                    raise DriverError(actual_reason, "57014")
-                return (None,)
-            return ("on", "repeatable read", "UTC", 1)
-
-        monkeypatch.setattr(worker, "_row", row)
-        checks = worker.new_checks()
-        if actual_reason == "canceling statement due to user request":
-            await worker._cancellation_check(connection, checks)
-            assert checks["cancellation"] == "passed"
-            assert checks["cancellation_recovery"] == "passed"
-            assert connection.rollback.await_count == 2
-        else:
-            with pytest.raises((worker.WorkerFailure, DriverError)):
-                await worker._cancellation_check(connection, checks)
-            assert checks["cancellation"] != "passed"
-            assert checks["cancellation_recovery"] == "not_checked"
-        connection.cancel_safe.assert_awaited_once()
-
-    asyncio.run(scenario())
-
-
 @pytest.mark.parametrize("fail_first", [False, True])
-def test_worker_connection_budget_is_sequential_and_failure_stops_reconnect(
+def test_worker_opens_one_connection_and_closes_on_success_or_failure(
     worker_request: worker.Request, monkeypatch: pytest.MonkeyPatch, fail_first: bool
 ) -> None:
     active = 0
@@ -586,26 +527,22 @@ def test_worker_connection_budget_is_sequential_and_failure_stops_reconnect(
         IsolationLevel=SimpleNamespace(REPEATABLE_READ="repeatable read"),
     )
     monkeypatch.setattr(worker.importlib, "import_module", lambda _: driver)
-    monkeypatch.setattr(worker, "_identity", AsyncMock())
     monkeypatch.setattr(
         worker,
-        "_timeout_check",
+        "_identity",
         AsyncMock(side_effect=DriverError("secret-canary") if fail_first else None),
     )
-    monkeypatch.setattr(worker, "_cancellation_check", AsyncMock())
     paths = {name: "/proc/self/fd/9" for name in ("ca.crt", "client.crt", "client.key")}
     checks = worker.new_checks()
     if fail_first:
         with pytest.raises(DriverError):
             asyncio.run(worker.verify(worker_request, paths, checks))
         assert attempts == 1
-        assert checks["reconnect"] == "not_checked"
         assert events == ["connect", "close"]
     else:
         asyncio.run(worker.verify(worker_request, paths, checks))
-        assert attempts == 2
-        assert checks["reconnect"] == "passed"
-        assert events == ["connect", "close", "connect", "close"]
+        assert attempts == 1
+        assert events == ["connect", "close"]
     assert active == 0
 
 

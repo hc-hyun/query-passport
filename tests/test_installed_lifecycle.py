@@ -23,7 +23,7 @@ from disposable_m3 import M3Database
 from test_live_integration import own_operator_binding
 
 from query_passport import operation_store as store
-from query_passport.contract import ERRORS, MAX_OUTPUT_BYTES
+from query_passport.contract import COMMANDS, ERRORS, MAX_OUTPUT_BYTES
 from query_passport.credential_delivery import inspect_delivery
 from query_passport.executor import private_directory
 from query_passport.lifecycle_binding import OPERATIONS
@@ -120,7 +120,7 @@ def installed_cli():
                     "-I",
                     "-c",
                     "import sys, pathlib, cryptography, query_passport; "
-                    "assert query_passport.__version__ == '0.3.0'; "
+                    "assert query_passport.__version__ == '0.4.0'; "
                     "assert pathlib.Path(query_passport.__file__).resolve().is_relative_to("
                     "pathlib.Path(sys.prefix).resolve())",
                 ],
@@ -192,8 +192,11 @@ class InstalledLifecycle:
             "Installed lifecycle response envelope mismatch",
         )
         check(response["contract_version"] == "1", "Installed lifecycle contract version mismatch")
-        check(response["tool_version"] == "0.3.0", "Installed lifecycle tool version mismatch")
-        check(response["command"] == command, "Installed lifecycle command mismatch")
+        check(response["tool_version"] == "0.4.0", "Installed lifecycle tool version mismatch")
+        check(
+            response["command"] == (command if command in COMMANDS else None),
+            "Installed lifecycle command mismatch",
+        )
         check(type(response["result"]) is dict, "Installed lifecycle result is not an object")
         if expected_error is not None:
             check(expected_error in ERRORS, "Installed lifecycle test expected an unknown code")
@@ -305,8 +308,8 @@ class InstalledLifecycle:
                             "Synthetic operation ownership changed; records retained",
                         )
                         check(
-                            operation.events()[-1]["phase"] == "rolled_back",
-                            "Synthetic operation is not recovered; records retained",
+                            operation.events()[-1]["phase"] == "verified",
+                            "Synthetic operation is not complete; records retained",
                         )
                         shutil.rmtree(operation_id, dir_fd=root)
             finally:
@@ -327,7 +330,7 @@ def assert_unchecked_application(result):
         )
 
 
-def test_installed_cli_provisions_rotates_verifies_and_recovers_only_owned_changes(installed_cli):
+def test_installed_cli_provisions_rotates_and_verifies(installed_cli):
     executable, workspace = installed_cli
     database = M3Database.create()
     try:
@@ -351,7 +354,7 @@ def test_installed_cli_provisions_rotates_verifies_and_recovers_only_owned_chang
         with own_operator_binding(binding):
             capabilities = cli.call("capabilities")
             check(
-                {"prepare", "issue", "apply", "deliver", "verify", "rotate", "status", "rollback"}
+                {"prepare", "issue", "apply", "deliver", "verify", "rotate", "status"}
                 <= set(capabilities["commands"]),
                 "Installed CLI is missing lifecycle commands",
             )
@@ -393,61 +396,19 @@ def test_installed_cli_provisions_rotates_verifies_and_recovers_only_owned_chang
                 cli.call("verify", database.request)["db_connectivity"] == "passed",
                 "Rotated credential did not connect",
             )
-            cli.step("rollback", prepared, expected_error="TARGET_DRIFT")
+            cli.step("rollback", prepared, expected_error="UNSUPPORTED_OPERATION")
             check(
                 inspect_delivery(database.credential_dir) == rotated_revision,
-                "Rejected parent rollback changed the active child credential",
-            )
-            check(
-                database.sql(
-                    "SELECT rolcanlogin::int FROM pg_roles WHERE rolname='passport_check'"
-                ).strip()
-                == b"1",
-                "Rejected parent rollback disabled the child's database role",
-            )
-            check(
-                cli.step("rollback", rotation)["phase"] == "rolled_back",
-                "Rotation rollback incomplete",
-            )
-            check(
-                inspect_delivery(database.credential_dir) == original_revision,
-                "Rotation rollback did not restore the exact previous revision",
-            )
-            check(
-                cli.call("verify", database.request)["db_connectivity"] == "passed",
-                "Restored credential did not connect",
-            )
-            check(
-                cli.step("status", rotation)["phase"] == "rolled_back",
-                "Rotation history lost recovery",
-            )
-
-            check(
-                cli.step("rollback", prepared)["phase"] == "rolled_back",
-                "Provision rollback incomplete",
-            )
-            check(
-                cli.step("rollback", prepared)["phase"] == "rolled_back",
-                "Rollback is not idempotent",
-            )
-            check(
-                cli.step("status", prepared)["phase"] == "rolled_back",
-                "Provision history lost recovery",
-            )
-            cli.call("verify", database.request, expected_error="CREDENTIAL_ACCESS_DENIED")
-            check(
-                inspect_delivery(database.credential_dir)["generation_id"] is None,
-                "Provision rollback did not retire the active credential",
+                "Unsupported rollback changed the active credential",
             )
             for plan in (prepared, rotation):
                 check(
                     database.credential_dir.joinpath(
                         "versions", plan["operation_id"], "bundle", "client.key"
                     ).is_file(),
-                    "Lifecycle recovery removed preserved synthetic credential history",
+                    "Lifecycle removed synthetic credential history",
                 )
             after = database.snapshot()
-            check(after["ssl_ca_file"] == "client-ca.crt", "Original client trust was not restored")
             check(
                 after["existing_roles"] == 1 and after["business_relations"] == 0,
                 "Unrelated fixture objects changed",

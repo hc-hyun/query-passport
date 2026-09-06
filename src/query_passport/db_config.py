@@ -3,9 +3,8 @@
 No files, database connections, roles, grants, or reloads are performed here.
 The executor must lock the target, verify its identity, compare the observed
 digest immediately before writing, and validate PostgreSQL's loaded rules. A
-new role must remain NOLOGIN until those rules are loaded; rollback must disable
-that role before removing its reject rules. These helpers do not establish any
-of those facts.
+new role must remain NOLOGIN until those rules are loaded. These helpers do not
+establish those facts.
 """
 
 import hashlib
@@ -162,7 +161,7 @@ def propose_config(
     """Prepend a new block or replace the first block after an exact digest check.
 
     Save ``owned_block(original, owner)`` and ``owned_block(proposed, owner)`` for
-    rollback. A replacement requires an observed full-file digest. Supplying the
+    inspection. A replacement requires an observed full-file digest. Supplying the
     digest for insertion also rejects all drift. This is a proposal, not an
     atomic file write: the executor must repeat its CAS under the target lock.
     """
@@ -186,38 +185,3 @@ def propose_config(
     proposed = block + (original if previous is None else original[previous.end :])
     _text(proposed)
     return proposed
-
-
-def restore_config(
-    current: str,
-    owner: str,
-    expected_applied: str,
-    previous_block: str | None,
-) -> str:
-    """Restore only the exact applied owner block, retaining unrelated changes.
-
-    ``expected_applied`` is the owned block, not a full configuration snapshot.
-    Missing, changed, duplicate, or malformed ownership markers fail closed.
-    Role login must already be disabled by the executor before calling rollback.
-    """
-    _name(owner, _ALIAS)
-    applied = _blocks(expected_applied)
-    _require(len(applied) == 1 and owner in applied and applied[owner].text == expected_applied)
-    if previous_block is not None:
-        previous = _blocks(previous_block)
-        _require(
-            len(previous) == 1 and owner in previous and previous[owner].text == previous_block
-        )
-    block = _blocks(current).get(owner)
-    _require(block is not None and block.text == expected_applied, "TARGET_DRIFT")
-    assert block is not None
-    suffix = current[block.end :]
-    restored = previous_block or ""
-    # Do not silently concatenate the old end marker with a new unrelated line.
-    _require(
-        not restored or restored.endswith("\n") or not suffix or suffix.startswith("\n"),
-        "TARGET_DRIFT",
-    )
-    result = current[: block.start] + restored + suffix
-    _text(result)
-    return result

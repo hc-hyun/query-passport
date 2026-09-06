@@ -179,7 +179,7 @@ def provision_through_apply(binding):
     return prepared
 
 
-@pytest.mark.parametrize("command", ["prepare", "issue", "apply", "deliver", "rollback", "status"])
+@pytest.mark.parametrize("command", ["prepare", "issue", "apply", "deliver", "status"])
 def test_each_stage_requires_current_operator_authorization(binding, backends, command):
     binding["operations"].remove(command)
     with pytest.raises(ContractError) as error:
@@ -239,7 +239,7 @@ def test_stages_cannot_skip_their_prerequisites(binding, backends, command):
     prepared = lifecycle.prepare(REQUEST, binding)
     with pytest.raises(ContractError) as error:
         execute(command, binding, prepared)
-    assert error.value.code == "RECOVERY_REQUIRED"
+    assert error.value.code == "OPERATION_ORDER_INVALID"
     assert [event["phase"] for event in events(prepared)] == ["prepared"]
     backends.db.apply.assert_not_called()
     backends.delivery.deliver.assert_not_called()
@@ -277,8 +277,8 @@ def test_config_drift_after_preparation_stops_issuance_and_keeps_plan(binding, b
     with pytest.raises(ContractError) as error:
         execute("issue", binding, prepared)
     assert error.value.code == "TARGET_DRIFT"
-    assert events(prepared)[-1]["phase"] == "partial_failure"
-    assert events(prepared)[-1]["error"] == "TARGET_DRIFT"
+    assert events(prepared)[-1]["phase"] != "verified"
+    assert events(prepared)[-1]["error"] is None
     assert artifact(prepared, "plan.json") == original
     backends.issuer.assert_not_called()
 
@@ -307,7 +307,7 @@ def test_partial_apply_retry_preserves_evidence_and_does_not_advance_to_delivery
     with pytest.raises(ContractError) as error:
         execute("apply", binding, prepared)
     assert error.value.code == "EXECUTOR_FAILED"
-    assert [event["phase"] for event in events(prepared)][-2:] == ["applying", "partial_failure"]
+    assert events(prepared)[-1]["phase"] == "applying"
     backends.delivery.deliver.assert_not_called()
     assert execute("apply", binding, prepared)["phase"] == "applied"
     assert backends.db.apply.call_count == 2
@@ -316,34 +316,18 @@ def test_partial_apply_retry_preserves_evidence_and_does_not_advance_to_delivery
     assert artifact(prepared, "plan.json") == original
 
 
-def test_partial_apply_can_rollback_without_assuming_apply_completed(binding, backends):
-    prepared = lifecycle.prepare(REQUEST, binding)
-    execute("issue", binding, prepared)
-    backends.db.apply.side_effect = ContractError("EXECUTOR_FAILED")
-    with pytest.raises(ContractError):
-        execute("apply", binding, prepared)
-    original = artifact(prepared, "plan.json")
-    assert execute("rollback", binding, prepared)["phase"] == "rolled_back"
-    backends.db.rollback.assert_called_once()
-    backends.delivery.rollback.assert_not_called()
-    assert artifact(prepared, "plan.json") == original
-
-
 @pytest.mark.parametrize("failure", [ContractError("TIMEOUT"), KeyboardInterrupt(), SystemExit(1)])
-def test_uncertain_apply_outcome_is_recorded_unknown_and_allows_scoped_recovery(
-    binding, backends, failure
-):
+def test_interruption_propagates_without_compensation(binding, backends, failure):
     prepared = lifecycle.prepare(REQUEST, binding)
     execute("issue", binding, prepared)
     backends.db.apply.side_effect = failure
     with pytest.raises(type(failure)):
         execute("apply", binding, prepared)
     last = events(prepared)[-1]
-    assert last["phase"] == "unknown"
-    assert last["error"] == ("TIMEOUT" if isinstance(failure, ContractError) else "INTERRUPTED")
-    assert execute("status", binding, prepared)["phase"] == "unknown"
-    assert execute("rollback", binding, prepared)["phase"] == "rolled_back"
-    backends.db.rollback.assert_called_once()
+    assert last["phase"] == "applying"
+    assert last["error"] is None
+    assert execute("status", binding, prepared)["phase"] == "applying"
+    backends.db.rollback.assert_not_called()
 
 
 def test_failed_candidate_verification_cannot_publish_active_generation(binding, backends):
@@ -354,7 +338,7 @@ def test_failed_candidate_verification_cannot_publish_active_generation(binding,
     assert error.value.code == "TLS_VERIFICATION_FAILED"
     assert backends.state.active is None
     assert "verified" not in {event["phase"] for event in events(prepared)}
-    assert events(prepared)[-1]["phase"] == "partial_failure"
+    assert events(prepared)[-1]["phase"] != "verified"
     projected, request = backends.verify.call_args.args
     assert request == REQUEST
     assert projected["operations"] == ["verify"]
@@ -370,7 +354,7 @@ def test_database_drift_during_candidate_verification_prevents_publication(bindi
         execute("deliver", binding, prepared)
     assert error.value.code == "TARGET_DRIFT"
     assert backends.state.active is None
-    assert events(prepared)[-1]["phase"] == "partial_failure"
+    assert events(prepared)[-1]["phase"] != "verified"
 
 
 def test_server_accepting_uncredentialed_or_plaintext_connection_blocks_publication(
@@ -383,13 +367,12 @@ def test_server_accepting_uncredentialed_or_plaintext_connection_blocks_publicat
     assert error.value.code == "VERIFICATION_FAILED"
     assert backends.state.active is None
     assert "verified" not in {event["phase"] for event in events(prepared)}
-    assert events(prepared)[-1]["error"] == "VERIFICATION_FAILED"
+    assert events(prepared)[-1]["error"] is None
     projected, request = backends.policy.call_args.args
     assert request == REQUEST
     assert projected["operations"] == ["verify"]
     assert projected["credential_dir"] == str(backends.state.candidate)
     assert "admin" not in projected and "lifecycle" not in projected
-    assert execute("rollback", binding, prepared)["phase"] == "rolled_back"
 
 
 def test_rejected_policy_probes_are_not_success_when_fresh_valid_client_also_fails(
@@ -428,28 +411,12 @@ def test_delivery_wrapper_preserves_known_callback_failure_classification(
     }[callback]
     provider.side_effect = ContractError(code)
 
-    def wrapped_deliver(
-        source, destination, operation_id, *, expected_revision, permission_setter, validator
-    ):
-        candidate = destination / "versions" / operation_id / "bundle"
-        try:
-            permission_setter(candidate)
-            validator(candidate)
-        except ContractError:
-            # The actual delivery adapter deliberately hides callback details.
-            # The coordinator must retain its own fixed classification before
-            # that adapter boundary, especially an uncertain helper timeout.
-            raise RuntimeError("DELIVERY_VALIDATION_FAILED") from None
-        pytest.fail("Failed callback reached active credential publication")
-
-    backends.delivery.deliver.side_effect = wrapped_deliver
     with pytest.raises(ContractError) as error:
         execute("deliver", binding, prepared)
     assert error.value.code == code
-    assert events(prepared)[-1]["phase"] == ("unknown" if code == "TIMEOUT" else "partial_failure")
-    assert events(prepared)[-1]["error"] == code
+    assert events(prepared)[-1]["phase"] != "verified"
+    assert events(prepared)[-1]["error"] is None
     assert backends.state.active is None
-    assert execute("rollback", binding, prepared)["phase"] == "rolled_back"
 
 
 def test_delivery_revalidates_issued_generation_before_candidate_publication(binding, backends):
@@ -481,7 +448,7 @@ def test_corrupt_or_mismatched_applied_receipt_blocks_delivery(binding, backends
     assert receipt.read_bytes() == raw
     backends.delivery.deliver.assert_not_called()
     assert backends.state.active is None
-    assert events(prepared)[-1]["phase"] == "partial_failure"
+    assert events(prepared)[-1]["phase"] != "verified"
 
 
 def test_delivery_uses_immutable_applied_ca_receipt_instead_of_accepting_current_trust(
@@ -522,61 +489,6 @@ def test_successful_delivery_and_status_keep_application_facts_separate(binding,
     assert backends.verify.call_count == positive_checks
     backends.policy.assert_called_once()
     assert "/synthetic/" not in json.dumps(result)
-
-
-def test_failed_delivery_can_rollback_and_cannot_restart_retired_operation(binding, backends):
-    prepared = provision_through_apply(binding)
-    backends.verify.return_value = {"status": "failed", "error": "CLIENT_AUTHENTICATION_FAILED"}
-    with pytest.raises(ContractError):
-        execute("deliver", binding, prepared)
-    first = execute("rollback", binding, prepared)
-    assert first["phase"] == "rolled_back"
-    backends.db.rollback.assert_called_once()
-    backends.delivery.rollback.assert_called_once()
-    assert execute("rollback", binding, prepared) == first
-    assert execute("status", binding, prepared)["phase"] == "rolled_back"
-    for command in ("issue", "apply", "deliver"):
-        with pytest.raises(ContractError) as error:
-            execute(command, binding, prepared)
-        assert error.value.code == "RECOVERY_REQUIRED"
-    assert backends.state.active is None
-
-
-def test_partial_rollback_retries_recovery_and_never_resumes_forward_apply(binding, backends):
-    prepared = provision_through_apply(binding)
-    backends.db.rollback.side_effect = [ContractError("TIMEOUT"), None]
-    with pytest.raises(ContractError) as error:
-        execute("rollback", binding, prepared)
-    assert error.value.code == "TIMEOUT"
-    assert events(prepared)[-1]["phase"] == "unknown"
-    with pytest.raises(ContractError) as error:
-        execute("apply", binding, prepared)
-    assert error.value.code == "RECOVERY_REQUIRED"
-    assert execute("rollback", binding, prepared)["phase"] == "rolled_back"
-
-
-@pytest.mark.parametrize("stage", ["issue", "apply", "deliver", "rollback"])
-def test_raw_provider_exception_never_escapes_result_or_journal(binding, backends, capsys, stage):
-    canary = "synthetic-private-provider-diagnostic"
-    prepared = lifecycle.prepare(REQUEST, binding)
-    if stage != "issue":
-        execute("issue", binding, prepared)
-    if stage in ("deliver", "rollback"):
-        execute("apply", binding, prepared)
-    provider = {
-        "issue": backends.issuer,
-        "apply": backends.db.apply,
-        "deliver": backends.delivery.deliver,
-        "rollback": backends.db.rollback,
-    }[stage]
-    provider.side_effect = RuntimeError(canary)
-    with pytest.raises(ContractError) as error:
-        execute(stage, binding, prepared)
-    assert error.value.code == "RECOVERY_REQUIRED"
-    assert canary not in str(error.value)
-    assert canary not in json.dumps(events(prepared))
-    captured = capsys.readouterr()
-    assert captured.out == captured.err == ""
 
 
 @pytest.mark.parametrize("initialize", [False, True])
@@ -634,5 +546,28 @@ def test_issuer_rejects_malformed_or_failed_output_without_echoing_provider_text
     monkeypatch.setattr(lifecycle, "run_process", lambda *args, **kwargs: (code, raw))
     with pytest.raises(ContractError) as error:
         lifecycle.issuer(binding, "a" * 32, "sha256:" + "b" * 64)
-    assert error.value.code in {"EXECUTOR_FAILED", "RECOVERY_REQUIRED"}
+    assert error.value.code in {"EXECUTOR_FAILED", "OPERATION_ORDER_INVALID"}
     assert canary not in str(error.value)
+
+
+def test_failure_is_not_masked_by_an_additional_journal_write(binding, backends, monkeypatch):
+    prepared = lifecycle.prepare(REQUEST, binding)
+    execute("issue", binding, prepared)
+    recorded = []
+    original = store.Operation.record
+    failure = ContractError("TIMEOUT")
+
+    def record(operation, phase, error=None):
+        recorded.append(phase)
+        if len(recorded) > 1:
+            raise store.StateError("STATE_WRITE_FAILED")
+        original(operation, phase, error)
+
+    monkeypatch.setattr(store.Operation, "record", record)
+    backends.db.apply.side_effect = failure
+    with pytest.raises(ContractError) as caught:
+        execute("apply", binding, prepared)
+    assert caught.value is failure
+    assert recorded == ["applying"]
+    backends.db.rollback.assert_not_called()
+    backends.delivery.deliver.assert_not_called()

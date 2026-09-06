@@ -8,7 +8,6 @@ from query_passport.db_config import (
     config_digest,
     owned_block,
     propose_config,
-    restore_config,
 )
 
 OWNER = "local-passport"
@@ -40,13 +39,12 @@ def assert_error(code, function, *args, **kwargs):
         "# comment with continuation \\\n# next line\n",
     ],
 )
-def test_new_block_is_first_preserves_every_original_byte_and_rolls_back(body, original):
+def test_new_block_is_first_preserves_every_original_byte(body, original):
     proposed = propose_config(original, OWNER, body)
     block = owned_block(proposed, OWNER)
     assert block is not None
     assert proposed == block + original
     assert proposed.startswith(f"# query-passport:{OWNER}:begin")
-    assert restore_config(proposed, OWNER, block, None) == original
 
 
 def test_crlf_is_used_for_new_block_without_rewriting_original():
@@ -64,16 +62,16 @@ def test_body_newline_variants_are_validated(body):
 
 
 @pytest.mark.parametrize("original_body,new_body", [(HBA, NEW_HBA), (IDENT, NEW_IDENT)])
-def test_owned_replacement_requires_digest_and_restores_previous_exactly(original_body, new_body):
+def test_owned_replacement_requires_digest_and_preserves_unowned_text(original_body, new_body):
     original = propose_config("# untouched\n", OWNER, original_body)
-    previous = owned_block(original, OWNER)
     assert_error("TARGET_DRIFT", propose_config, original, OWNER, new_body)
     changed = propose_config(
         original, OWNER, new_body, expected_before_digest=config_digest(original)
     )
     applied = owned_block(changed, OWNER)
     assert applied is not None
-    assert restore_config(changed, OWNER, applied, previous) == original
+    assert changed.endswith("# untouched\n")
+    assert applied != owned_block(original, OWNER)
 
 
 @pytest.mark.parametrize("has_previous", [False, True])
@@ -105,53 +103,12 @@ def test_replacement_below_unowned_content_does_not_silently_reorder_rules():
     )
 
 
-@pytest.mark.parametrize("replace_previous", [False, True])
-def test_rollback_preserves_unrelated_concurrent_edits(replace_previous):
-    original = "# original\nlocal all all peer\n"
-    if replace_previous:
-        original = propose_config(original, OWNER, HBA)
-    previous = owned_block(original, OWNER)
-    proposed = propose_config(
-        original, OWNER, NEW_HBA, expected_before_digest=config_digest(original)
-    )
-    applied = owned_block(proposed, OWNER)
-    assert applied is not None
-    current = "# concurrent prefix\n" + proposed.replace("# original", "# concurrent edit")
-    current += "# concurrent suffix without newline"
-    restored = restore_config(current, OWNER, applied, previous)
-    assert restored == (
-        "# concurrent prefix\n"
-        + original.replace("# original", "# concurrent edit")
-        + "# concurrent suffix without newline"
-    )
-
-
-def test_other_owners_are_never_changed_by_insertion_or_rollback():
+def test_other_owners_are_never_changed_by_insertion():
     other = propose_config("# unowned", "other-owner", IDENT)
     proposed = propose_config(other, OWNER, HBA)
     applied = owned_block(proposed, OWNER)
     assert applied is not None
     assert owned_block(proposed, "other-owner") == owned_block(other, "other-owner")
-    assert restore_config(proposed, OWNER, applied, None) == other
-    assert_error(
-        "INVALID_INPUT", restore_config, proposed, OWNER, owned_block(other, "other-owner"), None
-    )
-
-
-@pytest.mark.parametrize(
-    "change",
-    [
-        lambda text: text.replace("cert clientname=DN", "trust # clientname=DN"),
-        lambda text: text.replace("127.0.0.1/32", "0.0.0.0/0"),
-        lambda text: text.replace("\n", "\r\n"),
-        lambda text: "# block removed\n",
-    ],
-)
-def test_rollback_rejects_changed_owned_block(change):
-    proposed = propose_config("# unrelated\n", OWNER, HBA)
-    applied = owned_block(proposed, OWNER)
-    assert applied is not None
-    assert_error("TARGET_DRIFT", restore_config, change(proposed), OWNER, applied, None)
 
 
 @pytest.mark.parametrize(
@@ -173,27 +130,16 @@ def test_rollback_rejects_changed_owned_block(change):
     ],
 )
 def test_ambiguous_markers_fail_closed_for_all_operations(malformed):
-    applied = propose_config("", OWNER, HBA)
     assert_error("INVALID_INPUT", owned_block, malformed, OWNER)
     assert_error("INVALID_INPUT", propose_config, malformed, OWNER, HBA)
-    assert_error("INVALID_INPUT", restore_config, malformed, OWNER, applied, None)
 
 
-def test_existing_block_without_final_newline_can_be_replaced_and_restored():
+def test_existing_block_without_final_newline_can_be_replaced():
     previous = propose_config("", OWNER, HBA).rstrip("\n")
     changed = propose_config(
         previous, OWNER, NEW_HBA, expected_before_digest=config_digest(previous)
     )
-    assert restore_config(changed, OWNER, changed, previous) == previous
-    assert_error("TARGET_DRIFT", restore_config, changed + "# appended", OWNER, changed, previous)
-
-
-def test_rollback_refuses_full_file_snapshot_as_owned_block():
-    proposed = propose_config("# unowned\n", OWNER, HBA)
-    block = owned_block(proposed, OWNER)
-    assert block is not None
-    assert_error("INVALID_INPUT", restore_config, proposed, OWNER, proposed, None)
-    assert_error("INVALID_INPUT", restore_config, proposed, OWNER, block, proposed)
+    assert owned_block(changed, OWNER) == changed
 
 
 def test_digest_is_sensitive_to_every_byte_and_final_newline():

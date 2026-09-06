@@ -34,7 +34,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from . import local_pki as pki
 from .contract import ContractError
 
-OWNER = "query-passport-credential-delivery-v1"
+OWNER = "query-passport-credential-delivery-v2"
 BUNDLE_FILES = {"ca.crt", "client.crt", "client.key"}
 REVISION_FIELDS = {"generation_id", "revision", "certificate_sha256"}
 RECEIPT_FIELDS = {
@@ -61,7 +61,6 @@ ERROR_CODES = frozenset(
         "DELIVERY_PARTIAL_STATE",
         "DELIVERY_PERMISSION_DENIED",
         "DELIVERY_BUSY",
-        "DELIVERY_ROLLED_BACK",
         "DELIVERY_VALIDATION_FAILED",
         "INTERNAL_ERROR",
     }
@@ -161,7 +160,6 @@ def _create_store(destination: Path) -> None:
             return
         pki._entries(directory, set())
         pki._mkdir(directory, "versions")
-        pki._mkdir(directory, "rollbacks")
         pki._write_exclusive(directory, "lock", b"")
         pki._write_exclusive(directory, "active.json", _json(_empty()))
         pki._write_exclusive(directory, "owner.json", _json({"owner": OWNER, "version": 1}))
@@ -308,35 +306,6 @@ def _source(source_bundle: Path) -> tuple[dict[str, bytes], str, str]:
     return content, metadata["spec_digest"], metadata["certificate_sha256"]
 
 
-def _read_intent(generation: int, generation_id: str) -> dict[str, Any]:
-    intent = pki._parse(pki._read(generation, "intent.json"))
-    _require(
-        set(intent) == {"owner", "version", "generation_id", "spec_digest", "previous"}
-        and intent.get("owner") == OWNER
-        and type(intent.get("version")) is int
-        and intent["version"] == 1
-        and intent["generation_id"] == generation_id
-        and _hash(intent["spec_digest"]),
-        "DELIVERY_OWNERSHIP_REQUIRED",
-    )
-    _revision(intent["previous"])
-    return intent
-
-
-def _intent(directory: int, generation_id: str) -> dict[str, Any]:
-    versions = _child(directory, "versions")
-    generation = -1
-    try:
-        pki._directory_info(versions, private=True)
-        generation = _child(versions, generation_id)
-        pki._directory_info(generation, private=True)
-        return _read_intent(generation, generation_id)
-    finally:
-        if generation >= 0:
-            os.close(generation)
-        os.close(versions)
-
-
 def _receipt(directory: int, generation_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     versions = _child(directory, "versions")
     generation = bundle = -1
@@ -344,8 +313,7 @@ def _receipt(directory: int, generation_id: str) -> tuple[dict[str, Any], dict[s
         pki._directory_info(versions, private=True)
         generation = _child(versions, generation_id)
         pki._directory_info(generation, private=True)
-        pki._entries(generation, {"intent.json", "receipt.json", "bundle"})
-        intent = _read_intent(generation, generation_id)
+        pki._entries(generation, {"receipt.json", "bundle"})
         receipt = pki._parse(pki._read(generation, "receipt.json"))
         _require(
             set(receipt) == RECEIPT_FIELDS
@@ -376,11 +344,6 @@ def _receipt(directory: int, generation_id: str) -> tuple[dict[str, Any], dict[s
             "DELIVERY_OWNERSHIP_REQUIRED",
         )
         _revision(receipt["previous"])
-        _require(
-            receipt["previous"] == intent["previous"]
-            and receipt["spec_digest"] == intent["spec_digest"],
-            "DELIVERY_DRIFT",
-        )
         _require(
             _stat_shape(receipt["bundle_stat"])
             and type(receipt["file_stats"]) is dict
@@ -426,32 +389,6 @@ def _publish(directory: int, previous: dict[str, Any], target: dict[str, Any]) -
     _require(_active(directory) == previous, "DELIVERY_DRIFT")
     os.replace(temporary, "active.json", src_dir_fd=directory, dst_dir_fd=directory)
     os.fsync(directory)
-
-
-def _rollback_intent(directory: int, operation_id: str) -> dict[str, Any] | None:
-    rollbacks = _child(directory, "rollbacks")
-    try:
-        pki._directory_info(rollbacks, private=True)
-        try:
-            raw = pki._read(rollbacks, operation_id + ".json")
-        except FileNotFoundError:
-            return None
-        intent = pki._parse(raw)
-        _require(
-            set(intent) == {"owner", "version", "operation_id", "spec_digest", "from", "to"}
-            and intent.get("owner") == OWNER
-            and type(intent.get("version")) is int
-            and intent["version"] == 1
-            and intent["operation_id"] == operation_id,
-            "DELIVERY_OWNERSHIP_REQUIRED",
-        )
-        _require(_hash(intent["spec_digest"]), "DELIVERY_OWNERSHIP_REQUIRED")
-        if intent["from"] is not None:
-            _revision(intent["from"])
-        _revision(intent["to"])
-        return intent
-    finally:
-        os.close(rollbacks)
 
 
 def _inspect_delivery(destination: Path) -> dict[str, Any]:
@@ -516,7 +453,6 @@ def _deliver(
     _create_store(destination)
     with _store(destination) as directory:
         active = _active(directory)
-        _require(_rollback_intent(directory, operation_id) is None, "DELIVERY_ROLLED_BACK")
         versions = _child(directory, "versions")
         generation = descriptor = -1
         pinned_files: dict[str, int] = {}
@@ -543,19 +479,6 @@ def _deliver(
             generation = _child(versions, operation_id)
             pki._directory_info(generation, private=True)
             pki._entries(generation, set())
-            pki._write_exclusive(
-                generation,
-                "intent.json",
-                _json(
-                    {
-                        "owner": OWNER,
-                        "version": 1,
-                        "generation_id": operation_id,
-                        "spec_digest": specification,
-                        "previous": previous,
-                    }
-                ),
-            )
             pki._mkdir(generation, "bundle")
             descriptor = _child(generation, "bundle")
             for name in sorted(BUNDLE_FILES):
@@ -620,64 +543,14 @@ def _validate_candidate(destination: Path, operation_id: str, validator: Validat
     if validator is not None:
         try:
             validator(destination / "versions" / operation_id / "bundle")
-        except ContractError as error:
-            if error.code in ("TIMEOUT", "INTERRUPTED"):
-                raise
-            raise DeliveryError("DELIVERY_VALIDATION_FAILED") from None
+        except ContractError:
+            raise
         except Exception:  # noqa: BLE001 - a provider callback may contain secret diagnostics
             raise DeliveryError("DELIVERY_VALIDATION_FAILED") from None
 
 
-def _rollback(
-    destination: Path, operation_id: str, previous: dict[str, Any] | None
-) -> dict[str, Any]:
-    destination = pki._path(destination)
-    _require(_id(operation_id), "DELIVERY_INVALID_INPUT")
-    target = _empty() if previous is None else _revision(previous)
-    with _store(destination) as directory:
-        delivery_intent = _intent(directory, operation_id)
-        _require(delivery_intent["previous"] == target, "DELIVERY_INPUT_CONFLICT")
-        if target["generation_id"] is not None:
-            _, observed_previous = _receipt(directory, target["generation_id"])
-            _require(observed_previous == target, "DELIVERY_DRIFT")
-        active = _active(directory)
-        # A failed staging or candidate verification did not change the pointer.
-        # Its persisted intent still proves ownership and the expected predecessor.
-        current = None
-        if active != target:
-            _, current = _receipt(directory, operation_id)
-            _require(active == current, "DELIVERY_DRIFT")
-        intent = _rollback_intent(directory, operation_id)
-        if intent is not None:
-            _require(
-                intent["spec_digest"] == delivery_intent["spec_digest"] and intent["to"] == target,
-                "DELIVERY_INPUT_CONFLICT",
-            )
-            if active == target:
-                return {**target, "rolled_back_operation": operation_id, "reused": True}
-            _require(intent["from"] == current, "DELIVERY_DRIFT")
-        else:
-            expected = {
-                "owner": OWNER,
-                "version": 1,
-                "operation_id": operation_id,
-                "spec_digest": delivery_intent["spec_digest"],
-                "from": current,
-                "to": target,
-            }
-            rollbacks = _child(directory, "rollbacks")
-            try:
-                pki._write_exclusive(rollbacks, operation_id + ".json", _json(expected))
-            finally:
-                os.close(rollbacks)
-        if active != target:
-            assert current is not None
-            _publish(directory, current, target)
-        return {**target, "rolled_back_operation": operation_id, "reused": intent is not None}
-
-
 def _normalize(error: BaseException) -> DeliveryError | ContractError:
-    if isinstance(error, ContractError) and error.code in ("TIMEOUT", "INTERRUPTED"):
+    if isinstance(error, ContractError):
         return error
     if isinstance(error, DeliveryError):
         return error
@@ -729,14 +602,5 @@ def deliver(
             runtime_uid,
             runtime_gid,
         )
-    except Exception as error:  # noqa: BLE001 - credential boundary emits fixed codes only
-        raise _normalize(error) from None
-
-
-def rollback(
-    destination: Path, operation_id: str, previous: dict[str, Any] | None
-) -> dict[str, Any]:
-    try:
-        return _rollback(destination, operation_id, previous)
     except Exception as error:  # noqa: BLE001 - credential boundary emits fixed codes only
         raise _normalize(error) from None

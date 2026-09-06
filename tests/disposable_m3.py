@@ -60,6 +60,7 @@ class M3Database:
     network_name: str
     container_name: str
     helper_name: str
+    admin_username: str = "postgres"
     request: dict[str, Any] = field(default_factory=dict)
     binding: dict[str, Any] = field(default_factory=dict)
     admin: dict[str, Any] = field(default_factory=dict)
@@ -93,7 +94,13 @@ class M3Database:
         return self.base_directory / "existing-credential"
 
     @classmethod
-    def create(cls) -> M3Database:
+    def create(cls, *, admin_username: str = "postgres") -> M3Database:
+        if (
+            type(admin_username) is not str
+            or re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", admin_username) is None
+            or admin_username in {EXISTING_USER, "passport_check"}
+        ):
+            raise FixtureFailure("Disposable M3 admin identity invalid")
         image_ids = (
             docker(
                 [
@@ -125,6 +132,7 @@ class M3Database:
             network_name="query-passport-m3-net-" + owner,
             container_name="query-passport-m3-db-" + owner,
             helper_name="query-passport-m3-files-" + owner,
+            admin_username=admin_username,
             directory_identity=(info.st_dev, info.st_ino),
         )
         _private_file(directory / "fixture-owner", owner.encode("ascii"))
@@ -198,7 +206,7 @@ class M3Database:
         script = (
             "set -eu; "
             "initdb -D /var/lib/postgresql/data --auth-local=trust --auth-host=reject "
-            "--username=postgres --encoding=UTF8 --no-locale --no-sync >/dev/null 2>&1; "
+            f"--username={self.admin_username} --encoding=UTF8 --no-locale --no-sync >/dev/null 2>&1; "
             "cp /fixture-server/pg_hba.conf /var/lib/postgresql/data/pg_hba.conf; "
             "cp /fixture-server/pg_ident.conf /var/lib/postgresql/data/pg_ident.conf; "
             "cp /fixture-server/postgresql.auto.conf /var/lib/postgresql/data/postgresql.auto.conf; "
@@ -300,6 +308,8 @@ class M3Database:
             "network_cidr": subnet,
             "connection_limit": 2,
         }
+        if self.admin_username != "postgres":
+            self.admin["username"] = self.admin_username
         self.binding = {
             "binding_version": 1,
             "allowed_uid": os.geteuid(),
@@ -353,7 +363,7 @@ class M3Database:
         configuration = {
             "pg_hba.conf": (
                 "# Existing fixture authentication; preserve this byte-for-byte.\n"
-                "local all postgres trust\n"
+                f"local all {self.admin_username} trust\n"
                 "local all all reject\n"
                 "hostssl query_man fixture_existing " + subnet + " cert "
                 "clientname=DN map=fixture_existing\n"
@@ -456,7 +466,7 @@ class M3Database:
                 "-h",
                 SOCKET_DIRECTORY,
                 "-U",
-                "postgres",
+                self.admin_username,
                 "-d",
                 database,
                 "-v",

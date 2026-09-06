@@ -16,7 +16,7 @@ from cryptography import x509
 
 from . import executor
 from .contract import ContractError
-from .db_config import build_auth_rules, config_digest, owned_block, propose_config, restore_config
+from .db_config import build_auth_rules, config_digest, owned_block, propose_config
 
 MAX_CONFIG_BYTES = 131072
 _ADMIN_FIELDS = {"uid", "gid", "socket_directory", "pgdata", "network_cidr", "connection_limit"}
@@ -62,8 +62,23 @@ def _path(value: Any) -> str:
 
 def _binding(binding: dict[str, Any]) -> dict[str, Any]:
     admin = binding.get("admin")
-    _require(type(admin) is dict and admin.keys() == _ADMIN_FIELDS, "AUTHORIZATION_REQUIRED")
+    _require(
+        type(admin) is dict
+        and _ADMIN_FIELDS <= admin.keys() <= _ADMIN_FIELDS | {"username", "monitoring"},
+        "AUTHORIZATION_REQUIRED",
+    )
     assert isinstance(admin, dict)
+    username = _name(admin.get("username", "postgres"))
+    if "monitoring" in admin:
+        monitoring = admin["monitoring"]
+        _require(
+            type(monitoring) is dict
+            and monitoring.keys() == {"extension", "digest"}
+            and monitoring["extension"] == "pg_stat_statements"
+            and type(monitoring["digest"]) is str
+            and re.fullmatch(r"sha256:[a-f0-9]{64}", monitoring["digest"]) is not None,
+            "AUTHORIZATION_REQUIRED",
+        )
     for field in ("uid", "gid"):
         _require(
             type(admin[field]) is int and 1 <= admin[field] <= 2147483647, "AUTHORIZATION_REQUIRED"
@@ -88,7 +103,7 @@ def _binding(binding: dict[str, Any]) -> dict[str, Any]:
     build_auth_rules(
         database, binding["username"], binding["expected_dn"], admin["network_cidr"], "passport"
     )
-    return dict(admin)
+    return {**admin, "username": username}
 
 
 def _operation(operation_id: str) -> str:
@@ -130,7 +145,7 @@ def _json(raw: bytes) -> dict[str, Any]:
     if "error" in result:
         code = result["error"]
         _require(
-            code in ("TARGET_DRIFT", "EXECUTOR_FAILED", "RECOVERY_REQUIRED"), "EXECUTOR_FAILED"
+            code in ("TARGET_DRIFT", "EXECUTOR_FAILED", "DB_CONFIG_WRITE_FAILED"), "EXECUTOR_FAILED"
         )
         raise ContractError(code)
     return dict(result)
@@ -161,7 +176,7 @@ def _sql(binding: dict[str, Any], statement: str) -> dict[str, Any]:
             "--port",
             str(binding["request"]["profile"]["port"]),
             "--username",
-            "postgres",
+            admin["username"],
             "--dbname",
             binding["request"]["profile"]["database"],
             "--file",
@@ -172,11 +187,93 @@ def _sql(binding: dict[str, Any], statement: str) -> dict[str, Any]:
     return _json(raw)
 
 
-def _audit(subject: str, *, role_oid: bool = False) -> str:
+# PostgreSQL 18's shipped extension 1.12 uses these two C entry points. Definitions
+# and ACLs remain inside this single catalog snapshot; only their digest leaves DB.
+# https://github.com/postgres/postgres/tree/REL_18_STABLE/contrib/pg_stat_statements
+_MONITORING_CTE = """
+WITH passport_extension AS MATERIALIZED (
+  SELECT e.*, n.nspname, n.nspowner, n.nspacl FROM pg_extension e
+  JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_stat_statements'
+), passport_views AS MATERIALIZED (
+  SELECT c.oid, c.relname,
+    c.relkind='v' AND c.relnamespace=e.extnamespace AS valid,
+    jsonb_build_object('oid',c.oid::bigint,'name',c.relname,'kind',c.relkind,
+      'schema',jsonb_build_array(n.oid::bigint,n.nspname,n.nspowner::bigint,n.nspacl),
+      'owner',c.relowner::bigint,'acl',c.relacl,'options',c.reloptions,
+      'columns',(SELECT jsonb_agg(jsonb_build_array(a.attnum,a.attname,a.atttypid::bigint,
+        a.atttypmod,a.attcollation::bigint,a.attacl,a.attisdropped) ORDER BY a.attnum)
+        FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0),
+      'definition',CASE WHEN c.relkind='v' THEN pg_get_viewdef(c.oid,false) ELSE NULL END,
+      'rules',(SELECT jsonb_agg(to_jsonb(w) ORDER BY w.oid) FROM pg_rewrite w WHERE w.ev_class=c.oid),
+      'dependencies',(SELECT jsonb_agg(to_jsonb(d) ORDER BY d.objid,d.refclassid,d.refobjid,d.refobjsubid,d.deptype)
+        FROM pg_rewrite w JOIN pg_depend d ON d.classid='pg_rewrite'::regclass AND d.objid=w.oid
+        WHERE w.ev_class=c.oid)) AS metadata
+  FROM passport_extension e JOIN pg_depend d ON d.refclassid='pg_extension'::regclass
+    AND d.refobjid=e.oid AND d.classid='pg_class'::regclass AND d.objsubid=0 AND d.deptype='e'
+  JOIN pg_class c ON c.oid=d.objid JOIN pg_namespace n ON n.oid=c.relnamespace
+  WHERE c.relname IN ('pg_stat_statements','pg_stat_statements_info')
+), passport_functions AS MATERIALIZED (
+  SELECT p.oid, p.proname,
+    p.pronamespace=e.extnamespace AND l.lanname='c' AND p.prokind='f' AND NOT p.prosecdef
+      AND p.proconfig IS NULL AND p.probin='$libdir/pg_stat_statements'
+      AND p.prosupport=0 AND NOT p.proleakproof AND p.proisstrict
+      AND p.provolatile='v' AND p.proparallel='s' AND p.pronargdefaults=0
+      AND p.prorettype='record'::regtype
+      AND ((p.proname='pg_stat_statements' AND p.proargtypes='16'::oidvector
+            AND p.proretset AND p.prosrc='pg_stat_statements_1_12')
+        OR (p.proname='pg_stat_statements_info' AND p.proargtypes=''::oidvector
+            AND NOT p.proretset AND p.prosrc='pg_stat_statements_info')) AS valid,
+    jsonb_build_object('catalog',to_jsonb(p),'language',jsonb_build_array(l.oid::bigint,l.lanname),
+      'schema',jsonb_build_array(n.oid::bigint,n.nspname,n.nspowner::bigint,n.nspacl),
+      'definition',CASE WHEN p.prokind='f' THEN pg_get_functiondef(p.oid) ELSE NULL END) AS metadata
+  FROM passport_extension e JOIN pg_depend d ON d.refclassid='pg_extension'::regclass
+    AND d.refobjid=e.oid AND d.classid='pg_proc'::regclass AND d.objsubid=0 AND d.deptype='e'
+  JOIN pg_proc p ON p.oid=d.objid JOIN pg_namespace n ON n.oid=p.pronamespace
+  JOIN pg_language l ON l.oid=p.prolang
+  WHERE p.proname IN ('pg_stat_statements','pg_stat_statements_info')
+), passport_monitoring AS MATERIALIZED (
+  SELECT (
+    (SELECT count(*)=1 AND bool_and(extversion='1.12') FROM passport_extension)
+    AND (SELECT count(*)=2 AND count(DISTINCT relname)=2 AND bool_and(valid) FROM passport_views)
+    AND (SELECT count(*)=2 AND count(DISTINCT proname)=2 AND bool_and(valid) FROM passport_functions)
+    AND NOT EXISTS(SELECT 1 FROM passport_views v WHERE
+      (SELECT count(*) FROM pg_rewrite w WHERE w.ev_class=v.oid AND w.rulename='_RETURN'
+        AND w.ev_type='1' AND w.is_instead AND w.ev_enabled='O')<>1)
+    AND NOT EXISTS(SELECT 1 FROM passport_views v JOIN pg_rewrite w ON w.ev_class=v.oid
+      JOIN pg_depend d ON d.classid='pg_rewrite'::regclass AND d.objid=w.oid
+      WHERE w.rulename='_RETURN' AND NOT (
+        (d.refclassid='pg_class'::regclass AND d.refobjid=v.oid)
+        OR (d.refclassid='pg_proc'::regclass AND (
+          d.refobjid IN (SELECT oid FROM passport_functions)
+          OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+            WHERE p.oid=d.refobjid AND n.nspname='pg_catalog')))))
+  ) IS TRUE AS valid,
+  'sha256:' || encode(sha256(convert_to(jsonb_build_object('format',1,
+    'extension',(SELECT jsonb_agg(to_jsonb(e) ORDER BY e.oid) FROM passport_extension e),
+    'views',(SELECT jsonb_agg(metadata ORDER BY oid) FROM passport_views),
+    'functions',(SELECT jsonb_agg(metadata ORDER BY oid) FROM passport_functions)
+  )::text,'UTF8')),'hex') AS digest
+)
+"""
+
+
+def _audit(subject: str, *, role_oid: bool = False, monitoring: bool = False) -> str:
     # The caller passes either the fixed PUBLIC pseudo-role or a validated role
     # literal. Reject all user/extension routine EXECUTE, including functions that
     # could expose business data without an ordinary relation grant.
     user = "r.oid" if role_oid else f"'{subject}'"
+    table_privileges = f"""has_table_privilege({user}, c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+            OR has_any_column_privilege({user}, c.oid, 'SELECT,INSERT,UPDATE,REFERENCES')"""
+    routine_guard = ""
+    if monitoring:
+        table_privileges = f"""has_table_privilege({user}, c.oid, 'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+            OR has_any_column_privilege({user}, c.oid, 'INSERT,UPDATE,REFERENCES')
+            OR ((has_table_privilege({user}, c.oid, 'SELECT')
+              OR has_any_column_privilege({user}, c.oid, 'SELECT'))
+              AND NOT ((SELECT valid FROM passport_monitoring)
+                AND c.oid IN (SELECT oid FROM passport_views)))"""
+        routine_guard = """AND NOT ((SELECT valid FROM passport_monitoring)
+            AND p.oid IN (SELECT oid FROM passport_functions))"""
     return f"""json_build_object(
       'database_create', has_database_privilege({user}, current_database(), 'CREATE'),
       'database_temp', has_database_privilege({user}, current_database(), 'TEMP'),
@@ -186,26 +283,35 @@ def _audit(subject: str, *, role_oid: bool = False) -> str:
       'table_access', EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
         WHERE CASE WHEN n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
           AND c.relkind IN ('r','p','v','m','f') THEN
-          (has_table_privilege({user}, c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
-            OR has_any_column_privilege({user}, c.oid, 'SELECT,INSERT,UPDATE,REFERENCES')) ELSE false END),
+          ({table_privileges}) ELSE false END),
       'sequence_access', EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
         WHERE CASE WHEN n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND c.relkind='S'
           THEN has_sequence_privilege({user}, c.oid, 'SELECT,USAGE,UPDATE') ELSE false END),
       'routine_access', EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
         WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
-          AND has_function_privilege({user}, p.oid, 'EXECUTE')))
+          AND has_function_privilege({user}, p.oid, 'EXECUTE') {routine_guard}))
     """
 
 
 def snapshot(binding: dict[str, Any]) -> dict[str, Any]:
     """Observe private config text and fixed catalog facts; never expose this dict."""
-    _binding(binding)
+    admin = _binding(binding)
     target = executor.target_snapshot(binding)
     role = _name(binding["username"])
+    monitoring = "monitoring" in admin
+    monitoring_result = (
+        ", 'monitoring', (SELECT json_build_object('valid',valid,'digest',digest) FROM passport_monitoring)"
+        if monitoring
+        else ""
+    )
     sql = f"""
+    {_MONITORING_CTE if monitoring else ""}
     SELECT json_build_object(
       'version', current_setting('server_version_num')::int, 'encoding', current_setting('server_encoding'),
-      'database', current_database(), 'admin', current_user = 'postgres', 'ssl', current_setting('ssl') = 'on',
+      'database', current_database(),
+      'admin', current_user = '{admin["username"]}' AND session_user = '{admin["username"]}'
+        AND EXISTS(SELECT 1 FROM pg_roles WHERE rolname=current_user AND rolsuper),
+      'ssl', current_setting('ssl') = 'on',
       'pgdata', current_setting('data_directory'), 'hba_path', current_setting('hba_file'),
       'ident_path', current_setting('ident_file'),
       'hba', pg_read_file(current_setting('hba_file'), 0, {MAX_CONFIG_BYTES + 1}),
@@ -225,7 +331,7 @@ def snapshot(binding: dict[str, Any]) -> dict[str, Any]:
       'parse_ok', NOT EXISTS(SELECT 1 FROM pg_hba_file_rules WHERE error IS NOT NULL)
         AND NOT EXISTS(SELECT 1 FROM pg_ident_file_mappings WHERE error IS NOT NULL)
         AND NOT EXISTS(SELECT 1 FROM pg_file_settings WHERE error IS NOT NULL),
-      'public_audit', {_audit("public")},
+      'public_audit', {_audit("public", monitoring=monitoring)},
       'role', (SELECT json_build_object(
         'oid', r.oid::bigint, 'login', rolcanlogin, 'superuser', rolsuper, 'createdb', rolcreatedb,
         'createrole', rolcreaterole, 'inherit', rolinherit, 'replication', rolreplication,
@@ -236,7 +342,8 @@ def snapshot(binding: dict[str, Any]) -> dict[str, Any]:
           THEN shobj_description(r.oid,'pg_authid') ELSE NULL END,
         'settings', (SELECT coalesce(json_agg(json_build_object('database', d.datname, 'values', s.setconfig)), '[]')
           FROM pg_db_role_setting s LEFT JOIN pg_database d ON d.oid=s.setdatabase WHERE s.setrole=r.oid),
-        'audit', {_audit(role, role_oid=True)}) FROM pg_authid r WHERE rolname='{role}')
+        'audit', {_audit(role, role_oid=True, monitoring=monitoring)}) FROM pg_authid r WHERE rolname='{role}')
+      {monitoring_result}
     );
     """
     result = _sql(binding, sql)
@@ -262,9 +369,20 @@ def snapshot(binding: dict[str, Any]) -> dict[str, Any]:
             "parse_ok",
             "public_audit",
             "role",
-        },
+        }
+        | ({"monitoring"} if monitoring else set()),
         "EXECUTOR_FAILED",
     )
+    if monitoring:
+        observed = result["monitoring"]
+        _require(
+            type(observed) is dict
+            and observed.keys() == {"valid", "digest"}
+            and type(observed["valid"]) is bool
+            and type(observed["digest"]) is str
+            and re.fullmatch(r"sha256:[a-f0-9]{64}", observed["digest"]) is not None,
+            "EXECUTOR_FAILED",
+        )
     for field in ("hba", "ident"):
         value = result[field]
         _require(type(value) is str and len(value.encode()) <= MAX_CONFIG_BYTES, "EXECUTOR_FAILED")
@@ -296,6 +414,15 @@ def _clean_audit(audit: Any) -> bool:
 
 def _layout(binding: dict[str, Any], observed: dict[str, Any]) -> None:
     admin = _binding(binding)
+    if "monitoring" in admin:
+        monitoring = observed.get("monitoring")
+        _require(type(monitoring) is dict and monitoring.keys() == {"valid", "digest"})
+        assert isinstance(monitoring, dict)
+        _require(
+            monitoring["valid"] is True and monitoring["digest"] == admin["monitoring"]["digest"]
+        )
+    else:
+        _require("monitoring" not in observed)
     pgdata = admin["pgdata"]
     _require(
         type(observed["version"]) is int and 180000 <= observed["version"] < 190000,
@@ -402,9 +529,9 @@ if [ ! -f "$temporary/prior" ] || [ -L "$temporary/prior" ] ||
    [ "$(digest "$temporary/prior")" != "$expected" ] ||
    [ "$(stat -c '%d:%i:%a:%u:%g:%h:%s:%Y' -- "$temporary/prior")" != "$stable_metadata" ]; then
   ln -P -- "$temporary/prior" "$file" 2>/dev/null || :
-  fail RECOVERY_REQUIRED
+  fail DB_CONFIG_WRITE_FAILED
 fi
-ln -- "$temporary/content" "$file" 2>/dev/null || fail RECOVERY_REQUIRED
+ln -- "$temporary/content" "$file" 2>/dev/null || fail DB_CONFIG_WRITE_FAILED
 rm -- "$temporary/content"
 sync -f .
 printf '{"status":"written"}\n'
@@ -468,15 +595,7 @@ if [ "$action" = install ]; then
   if [ "$state" = absent ]; then
     cat "$file" "$temporary/block" > "$temporary/new"
   fi
-elif [ "$action" = remove ] && [ "$state" = present ]; then
-  size=$(wc -c < "$file")
-  if [ "$start" -gt 0 ] && [ "$finish" -lt "$size" ]; then
-    before=$(dd if="$file" bs=1 skip="$((start-1))" count=1 2>/dev/null | od -An -t u1 | tr -d ' ')
-    after=$(dd if="$file" bs=1 skip="$finish" count=1 2>/dev/null | od -An -t u1 | tr -d ' ')
-    [ "$before" = 10 ] || [ "$after" = 10 ] || fail TARGET_DRIFT
-  fi
-  cp -- "$temporary/base" "$temporary/new"
-elif [ "$action" != observe ] && [ "$action" != remove ]; then
+elif [ "$action" != observe ]; then
   fail EXECUTOR_FAILED
 fi
 if [ -f "$temporary/new" ]; then
@@ -489,9 +608,9 @@ if [ -f "$temporary/new" ]; then
      [ "$(digest "$temporary/prior")" != "$current" ] ||
      [ "$(stat -c '%d:%i:%a:%u:%g:%h:%s:%Y' -- "$temporary/prior")" != "$stable_metadata" ]; then
     ln -P -- "$temporary/prior" "$file" 2>/dev/null || :
-    fail RECOVERY_REQUIRED
+    fail DB_CONFIG_WRITE_FAILED
   fi
-  ln -- "$temporary/new" "$file" 2>/dev/null || fail RECOVERY_REQUIRED
+  ln -- "$temporary/new" "$file" 2>/dev/null || fail DB_CONFIG_WRITE_FAILED
   rm -- "$temporary/new"
   sync -f .
 fi
@@ -563,7 +682,7 @@ def _replace(
 def _auto(
     binding: dict[str, Any], before: dict[str, Any], operation_id: str, action: str
 ) -> dict[str, Any]:
-    _require(action in ("observe", "install", "remove"), "EXECUTOR_FAILED")
+    _require(action in ("observe", "install"), "EXECUTOR_FAILED")
     path = _rules(binding, before, operation_id)["ca"]
     block = (
         f"\n# query-passport-auto:{operation_id}:begin\nssl_ca_file = '{path}'\n"
@@ -795,114 +914,41 @@ def apply(
     _require(current["ca"]["setting"] in (before["ca"]["setting"], rules["ca"]))
     if current["role"] is not None:
         _require(_safe_role(binding, current["role"], operation_id), "PERMISSION_DENIED")
-    mutation_started = False
-    try:
-        mutation_started = True
-        if current["role"] is None:
-            _create(binding, operation_id)
-        else:
-            _disable(binding, operation_id, current["role"]["oid"])
-        result = _shell(
-            binding,
-            _CA_SCRIPT,
-            [
-                _ca_path(binding, before),
-                (before["ca_digest"] or "sha256:-")[7:],
-                PurePosixPath(rules["ca"]).name,
-            ],
-            client_ca,
-        )
-        _require(
-            result.get("status") == "present" and type(result.get("digest")) is str,
-            "EXECUTOR_FAILED",
-        )
-        applied_ca_digest = result["digest"]
-        for field, filename in (("ident", "pg_ident.conf"), ("hba", "pg_hba.conf")):
-            if current[field] != rules[field]:
-                _replace(binding, filename, current[field], rules[field], operation_id)
-        installed_auto = _auto(binding, before, operation_id, "install")
-        _check_rules(binding, rules)
-        _reload(binding, rules["ca"])
-        checked = snapshot(binding)
-        _require(_safe_role(binding, checked["role"], operation_id), "PERMISSION_DENIED")
-        _require(checked["role"]["login"] is False)
-        _require(checked["target_snapshot"] == before["target_snapshot"])
-        _require(
-            checked["ca_digest"] == applied_ca_digest and checked["ca"]["setting"] == rules["ca"]
-        )
-        _require(checked["auto_digest"] == installed_auto["digest"])
-        _require(checked["hba"] == rules["hba"] and checked["ident"] == rules["ident"])
-        _enable(binding, operation_id, checked["role"]["oid"])
-        verified = verify_applied(
-            binding, {**plan, "applied_ca_digest": applied_ca_digest}, operation_id
-        )
-        return {**verified, "ca_digest": applied_ca_digest}
-    except BaseException as error:
-        if mutation_started:
-            try:
-                observed = snapshot(binding)
-                if (
-                    observed["role"] is not None
-                    and observed["role"].get("marker") == "query-passport:" + operation_id
-                ):
-                    _disable(binding, operation_id, observed["role"]["oid"])
-            except BaseException:  # noqa: BLE001 - recovery classification remains mandatory
-                pass
-            if isinstance(error, (KeyboardInterrupt, SystemExit)) or (
-                isinstance(error, ContractError) and error.code in ("TIMEOUT", "INTERRUPTED")
-            ):
-                raise
-            raise ContractError("RECOVERY_REQUIRED") from error
-        raise
-
-
-def rollback(binding: dict[str, Any], plan: dict[str, Any], operation_id: str) -> dict[str, Any]:
-    """Disable owned login, remove only exact owned blocks, retain role and CA file."""
-    _binding(binding)
-    before = _before(plan)
-    rules = _rules(binding, before, operation_id)
-    current = snapshot(binding)
-    _require(current["target_snapshot"] == before["target_snapshot"])
-    role = current["role"]
-    if role is not None:
-        _require(role.get("marker") == "query-passport:" + operation_id, "PERMISSION_DENIED")
-    try:
-        if role is not None:
-            _disable(binding, operation_id, role["oid"])
-        # A malformed current configuration must not prevent closing our login.
-        # File recovery still requires the supported, parsable configuration.
-        _layout(binding, current)
-        for field, filename in (("hba", "pg_hba.conf"), ("ident", "pg_ident.conf")):
-            actual = owned_block(current[field], rules["owner"])
-            if actual is None:
-                continue
-            expected = owned_block(rules[field], rules["owner"])
-            assert expected is not None
-            restored = restore_config(current[field], rules["owner"], expected, None)
-            _replace(binding, filename, current[field], restored, operation_id)
-        _auto(binding, before, operation_id, "remove")
-        _reload(binding, before["ca"]["setting"])
-        after = snapshot(binding)
-        _require(after["target_snapshot"] == before["target_snapshot"])
-        _require(
-            after["role"] is None
-            or (
-                after["role"].get("marker") == "query-passport:" + operation_id
-                and after["role"]["login"] is False
-            )
-        )
-        _require(
-            all(owned_block(after[field], rules["owner"]) is None for field in ("hba", "ident"))
-        )
-        return {
-            "status": "rolled_back",
-            "role": "nologin_retained" if role is not None else "absent",
-            "owned_ca": "retained",
-            "db_connectivity": "not_checked",
-        }
-    except BaseException as error:
-        if isinstance(error, (KeyboardInterrupt, SystemExit)) or (
-            isinstance(error, ContractError) and error.code in ("TIMEOUT", "INTERRUPTED")
-        ):
-            raise
-        raise ContractError("RECOVERY_REQUIRED") from error
+    if current["role"] is None:
+        _create(binding, operation_id)
+    else:
+        _disable(binding, operation_id, current["role"]["oid"])
+    result = _shell(
+        binding,
+        _CA_SCRIPT,
+        [
+            _ca_path(binding, before),
+            (before["ca_digest"] or "sha256:-")[7:],
+            PurePosixPath(rules["ca"]).name,
+        ],
+        client_ca,
+    )
+    _require(
+        result.get("status") == "present" and type(result.get("digest")) is str,
+        "EXECUTOR_FAILED",
+    )
+    applied_ca_digest = result["digest"]
+    for field, filename in (("ident", "pg_ident.conf"), ("hba", "pg_hba.conf")):
+        if current[field] != rules[field]:
+            _replace(binding, filename, current[field], rules[field], operation_id)
+    installed_auto = _auto(binding, before, operation_id, "install")
+    _check_rules(binding, rules)
+    _reload(binding, rules["ca"])
+    checked = snapshot(binding)
+    _layout(binding, checked)
+    _require(_safe_role(binding, checked["role"], operation_id), "PERMISSION_DENIED")
+    _require(checked["role"]["login"] is False)
+    _require(checked["target_snapshot"] == before["target_snapshot"])
+    _require(checked["ca_digest"] == applied_ca_digest and checked["ca"]["setting"] == rules["ca"])
+    _require(checked["auto_digest"] == installed_auto["digest"])
+    _require(checked["hba"] == rules["hba"] and checked["ident"] == rules["ident"])
+    _enable(binding, operation_id, checked["role"]["oid"])
+    verified = verify_applied(
+        binding, {**plan, "applied_ca_digest": applied_ca_digest}, operation_id
+    )
+    return {**verified, "ca_digest": applied_ca_digest}

@@ -55,8 +55,8 @@ def test_state_backup_and_history_survive_reopening(state_home):
     with store.operation(operation_id) as reopened:
         assert reopened.read_artifact("hba.before") == b"# synthetic baseline\n"
         assert [event["phase"] for event in reopened.events()] == ["prepared", "issuing"]
-        reopened.record("partial_failure", "PKI_PARTIAL_STATE")
-        assert reopened.events()[-1]["error"] == "PKI_PARTIAL_STATE"
+        reopened.record("issuing")
+        assert reopened.events()[-1]["error"] is None
     directory = store.state_directory() / operation_id
     assert directory.stat().st_mode & 0o777 == 0o700
     assert (directory / "hba.before").stat().st_mode & 0o777 == 0o600

@@ -275,7 +275,7 @@ def test_cleanup_known_failure_requires_positive_absence_observation(monkeypatch
     if remaining:
         with pytest.raises(ContractError) as caught:
             executor.cleanup_container(name)
-        assert caught.value.code == "RECOVERY_REQUIRED"
+        assert caught.value.code == "EXECUTOR_CLEANUP_FAILED"
     else:
         assert executor.cleanup_container(name) is None
 

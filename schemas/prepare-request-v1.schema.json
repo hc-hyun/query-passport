@@ -104,9 +104,9 @@
         "enum": [
           "profile.inspect.v1",
           "plan.offline.v1",
-          "connection.verify.v1",
-          "lifecycle.local.v1",
-          "credential.rotate.local.v1"
+          "connection.verify.v2",
+          "lifecycle.local.v2",
+          "credential.rotate.local.v2"
         ]
       }
     },

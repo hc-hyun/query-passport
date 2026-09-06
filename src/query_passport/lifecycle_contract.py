@@ -7,6 +7,7 @@ Only the operator-managed binding authorizes each requested lifecycle command.
 from typing import Any
 
 from .contract import (
+    ERRORS,
     LIFECYCLE_COMMANDS,
     ContractError,
     envelope,
@@ -16,28 +17,6 @@ from .contract import (
     require,
     validate,
 )
-
-_STATE_ERRORS = {
-    "STATE_ACCESS_DENIED",
-    "STATE_WRITE_FAILED",
-    "STATE_INVALID",
-    "STATE_CONFLICT",
-    "STATE_PARTIAL",
-    "OPERATION_BUSY",
-}
-_DELIVERY_ERRORS = {
-    "DELIVERY_INVALID_INPUT": "EXECUTOR_FAILED",
-    "DELIVERY_ACCESS_DENIED": "CREDENTIAL_ACCESS_DENIED",
-    "DELIVERY_OWNERSHIP_REQUIRED": "RECOVERY_REQUIRED",
-    "DELIVERY_INPUT_CONFLICT": "TARGET_DRIFT",
-    "DELIVERY_DRIFT": "TARGET_DRIFT",
-    "DELIVERY_PARTIAL_STATE": "RECOVERY_REQUIRED",
-    "DELIVERY_PERMISSION_DENIED": "CREDENTIAL_ACCESS_DENIED",
-    "DELIVERY_BUSY": "RECOVERY_REQUIRED",
-    "DELIVERY_ROLLED_BACK": "RECOVERY_REQUIRED",
-    "DELIVERY_VALIDATION_FAILED": "VERIFICATION_FAILED",
-    "INTERNAL_ERROR": "INTERNAL_ERROR",
-}
 
 
 def validate_request(command: str, request: Any) -> dict[str, Any]:
@@ -72,7 +51,6 @@ def failure_result(command: str | None, request: dict[str, Any] | None) -> dict[
         "operation_id": validated["operation"]["id"],
         "plan_digest": validated["operation"]["plan_digest"],
         "outcome": "not_confirmed",
-        "next_action": "status_or_scoped_recovery",
     }
 
 
@@ -96,12 +74,8 @@ def respond_lifecycle(command: str, request: Any) -> dict[str, Any]:
             result = local_lifecycle.execute(
                 command, base, binding, operation["id"], operation["plan_digest"]
             )
-    except StateError as error:
-        raise ContractError(
-            "RECOVERY_REQUIRED" if error.code in _STATE_ERRORS else "INTERNAL_ERROR"
-        ) from None
-    except DeliveryError as error:
-        raise ContractError(_DELIVERY_ERRORS.get(error.code, "INTERNAL_ERROR")) from None
+    except (StateError, DeliveryError) as error:
+        raise ContractError(error.code if error.code in ERRORS else "INTERNAL_ERROR") from None
     status = (
         "planned" if command == "prepare" else "validated" if command == "status" else "succeeded"
     )

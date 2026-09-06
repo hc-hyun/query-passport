@@ -1,7 +1,7 @@
 # Query Man 스킬과 Query Passport의 호출 계약
 
-이 문서는 **0.3.0의 로컬 구현 계약과 이후 운영 설계안**을 구분한다. 계약 major 1의
-오프라인 검사, 로컬 Docker 검증과 제한된 발급·적용·전달·교체·복구 CLI를 구현했다.
+이 문서는 **0.4.0의 로컬 구현 계약과 이후 운영 설계안**을 구분한다. 계약 major 1의
+오프라인 검사, 로컬 Docker 검증과 제한된 발급·적용·전달·교체 CLI를 구현했다.
 Kubernetes 전달과 protected 승인 backend는 미구현이다.
 현재 Query Man의 profile, 인증 단위, credential layout과 운영 승인을 변경하는 문서가 아니다.
 
@@ -40,7 +40,6 @@ CLI 호출로 우회하지 않는다. repo 전용 작업에는 offline `inspect`
 | `apply` | 3 | 새 제한 확인 role, 기존 CA를 보존한 trust, 소유 HBA·ident 구간 적용 |
 | `deliver` | 3 | 새 버전을 실제 인증·거부 검사한 뒤 private active pointer 전환 |
 | `rotate` | 3 | 같은 CA·identity의 새 키/인증서 발급·신규 연결 검증 후 버전 전환 |
-| `rollback` | 3 | 해당 operation 소유 변경 복구. Rotation은 재검증한 이전 credential만 복구 |
 | `status` | 3 | 권한·대상과 결합된 operation의 마지막 기록 조회. 신규 DB 인증 검사는 아님 |
 
 `verify`는 접속·bounded catalog 조회를 수행하므로 offline 검사가 아니다. 쓰기 방지와 timeout을 강제하고
@@ -96,8 +95,8 @@ query-passport plan --request request.json --format json
 
 응답 envelope에는 `contract_version`, `tool_version`, `command`, `status`, `scope`, `result`, `errors`를 둔다.
 capabilities 응답은 지원 contract major와 실제 구현된 기능 ID, backend 유형, 정책 revision을 제공한다.
-기능 ID는 `profile.inspect.v1`, `plan.offline.v1`, `connection.verify.v1`, `lifecycle.local.v1`,
-`credential.rotate.local.v1`이다. 정책 revision은 `m3-local-lifecycle-1`이다.
+기능 ID는 `profile.inspect.v1`, `plan.offline.v1`, `connection.verify.v2`, `lifecycle.local.v2`,
+`credential.rotate.local.v2`이다. 정책 revision은 `mvp-local-lifecycle-2`이다.
 스킬은 필요한 기능과 계약 major가 없으면 해당 작업을 중단하고 호환되는 도구 준비를 안내한다.
 새 도구라고 가정해 알 수 없는 필드를 무시하거나 하위 버전으로 자동 실행하지 않는다.
 
@@ -117,7 +116,9 @@ capabilities 응답은 지원 contract major와 실제 구현된 기능 ID, back
     "port": 5432,
     "database": "query_man",
     "sslmode": "verify-full",
-    "authentication": {"type": "client-certificate"}
+    "authentication": {
+      "type": "client-certificate"
+    }
   },
   "source_count": 0
 }
@@ -179,7 +180,7 @@ M1의 `actions`는 빈 배열이며 후속 검증의 전제·중단 조건만 �
 
 CLI·executor 예외의 `status`는 `failed`, `scope`는 `null`이다. `verify` worker가 반환한 실패는
 `scope: database-only`와 검사별 결과를 유지한다. 오프라인·prepare·입력 검증 실패의 `result`는
-빈 object이며, 유효한 후속 operation 요청의 오류에는 아래 복구 참조만 남긴다. 알 수 없는 명령 이름은
+빈 object이며, 유효한 후속 operation 요청의 오류에는 아래 작업 참조만 남긴다. 알 수 없는 명령 이름은
 `command: null`로 반환한다. stdout 자체에 쓸 수 없으면 exit 1이며 JSON 전달을 보장할 수 없다.
 스킬은 무응답·잘린 출력·비영 종료를 성공으로 취급하지 않는다.
 
@@ -189,65 +190,31 @@ CLI·executor 예외의 `status`는 `failed`, `scope`는 `null`이다. `verify` 
 
 `prepare`는 기본 요청에 선택적 `intent: provision` 또는 `intent: rotate`를 받는다. 생략하면
 `provision`이다. [Prepare schema](../schemas/prepare-request-v1.schema.json)를 따른다.
-`issue`, `apply`, `deliver`, `rotate`, `rollback`, `status`는 기본 요청에
+`issue`, `apply`, `deliver`, `rotate`, `status`는 기본 요청에
 `operation: {id, plan_digest}`를 추가한다. `id`는 32자리 소문자 hex이고 `plan_digest`는
 `sha256:`와 64자리 소문자 hex다. [Operation schema](../schemas/operation-request-v1.schema.json)를 따른다.
 `verify`와 오프라인 명령에는 이 추가 필드를 허용하지 않는다.
 
 `prepare` 결과는 `phase: prepared`, `intent`, `operation_id`, `plan_digest`, `mode: live`,
-`source_count`, `target_identity: passed`, `recovery: owned_changes_only`와 다음 검토 정보를 담는다.
+`source_count`, `target_identity: passed`, `recovery: not_supported`와 다음 검토 정보를 담는다.
 `actions`와 `preserves`는 고정된 변경·보존 목록, `account`와 `client_dn`은 binding에서 검증한
 확인 identity, `certificate_lifetime_days`는 승인된 최대 요청 수명(1–90일)이다. 실제 인증서
 수명은 CA 만료일에 제한될 수 있다. 내부 경로·설정 원문·인증서 원문은 반환하지 않는다.
 
 후속 성공 결과는 검토 정보를 제외한 같은 요약이다. `issue`는 `issued`, `apply`는 `applied`,
-`deliver`·`rotate`는 새 연결 검증 후 `verified`, `rollback`은 `rolled_back`이다.
+`deliver`·`rotate`는 새 연결 검증 후 `verified`다. Rollback은 지원하지 않는다.
 `status`는 마지막 기록의 phase를 반환하지만 연결·인증·인증서 사실은 모두 `not_checked`다.
 새 검증이 완료된 `deliver`·`rotate`만 세 사실을 `passed`로 반환한다. Source inventory,
 reader 권한, source admission, deployment와 application readiness는 항상 `not_checked`다.
 
 성공 envelope는 prepare `planned`, status `validated`, 나머지 `succeeded`다. 실패 envelope는
 `failed`·`scope: null`이며 유효한 operation 요청에만 `operation_id`, `plan_digest`,
-`outcome: not_confirmed`, `next_action: status_or_scoped_recovery`를 반환한다. 이 참조는
+`outcome: not_confirmed`를 반환한다. 이 참조는
 존재·권한·실제 phase를 확인했다는 뜻이 아니다. 실패 응답으로 완료 단계나 rollback 성공을 추정하지 않는다.
 입력 검증 후 lifecycle 제한은 180초(`limits.lifecycle_timeout_seconds`)다. 스킬은 process 종료와
 JSON·종료 코드 일치를 확인하고 충분한 bounded cleanup 여유를 둔다.
 
-상세 operator v2 설정, 명령 예시와 복구 순서는 [로컬 lifecycle](local-lifecycle.md)을 따른다.
-
-### 운영 backend 확장 설계
-
-실행 가능한 계획에는 정규화된 입력 digest, 정책·도구 revision, 생성·만료 시각, target snapshot,
-대상 generation, 고정된 action 목록·순서, 예측 영향, 전제·중단 조건, 검증·복구 경계를 포함한다.
-snapshot에는 승인된 환경·DB identity와 대상 설정 revision을 묶는다. 민감한 원자료는 환경 기록 저장소에 둔다.
-offline 계획은 검증하지 않은 항목을 `unknown`으로 남기고 이를 성공으로 바꾸지 않는다.
-
-승인은 별도 신뢰 경로에서 확인한 주체·실행자·대상·계획 digest·action 범위·유효 기간·기록 책임에 결합한다.
-도구는 승인 backend 또는 승인된 실행 context에서 이를 검증한다. 스킬이 만든 `approved: true`,
-`--yes`, 계획 파일의 문구, 대화 요약은 실행 권한을 대신하지 않는다.
-설계의 `plan_handle`·`authorization_handle`은 비밀 참조나 bearer 권한이 아닌 불투명 조회 표식이다.
-표식만으로 기록 조회·실행이 가능하지 않도록 별도 인증·권한 검사를 거친다.
-
-계획 후 대상·설정·소유자·endpoint가 바뀌면 `TARGET_DRIFT`로 중단한다. 변경 직전 다시 확인하고
-변경 단계 사이에도 전제 조건을 검증한다. 동일 alias가 다른 컨테이너나 DB를 가리키면 새 snapshot이 필요하다.
-해당 환경·대상에는 단일 변경 실행자 또는 잠금을 두어 동시 변경 충돌을 감지한다.
-
-machine action category는 최소 다음을 구별하는 **설계안**이다.
-
-| category | 범위와 구분 이유 |
-|---|---|
-| `offline_validation` | 지정된 공개 입력 검사; live 실행 권한 불필요 |
-| `authenticated_read_only` | DB 접속·metadata·TLS 검사; 쓰기 없음 |
-| `certificate_issuance` | PKI 발급으로 새 자격 증명 생성 |
-| `database_authentication_change` | CA trust, HBA, DN mapping 변경 |
-| `database_check_identity_change` | 필요성이 승인된 DB 확인용 role의 제한된 생성·설정; source reader와 구별 |
-| `credential_delivery` | 승인된 Secret/파일 목적지에 전달 |
-| `workload_transition` | rollout, process restart, traffic 전환 |
-| `credential_retirement` | 이전 인증서 trust 제거·폐기; 일반 갱신 성공과 별도 확인 |
-| `scoped_recovery` | 해당 operation의 백업·변경만 이용한 승인된 복구 |
-
-`scope: database-only`로 source reader·view·schema·table·DB 생성이나 application 활성화를 끼워 넣지 않는다.
-확인용 계정이 없으면 첫 `verify`는 필요한 권한을 보고한다. 명령 내부에서 계정을 자동 생성하지 않는다.
+상세 operator v2 설정, 명령 예시와 재실행 방법는 [로컬 lifecycle](local-lifecycle.md)을 따른다.
 
 ## 6. 안전한 결과와 실패 의미
 
@@ -261,7 +228,7 @@ driver 오류, 연결 문자열, SQL literal, host 파일 경로, Secret 식별�
 ```json
 {
   "contract_version": "1",
-  "tool_version": "0.3.0",
+  "tool_version": "0.4.0",
   "command": "plan",
   "status": "planned",
   "scope": "database-only",
@@ -282,7 +249,7 @@ driver 오류, 연결 문자열, SQL literal, host 파일 경로, Secret 식별�
     "source_admission": "not_checked",
     "application_readiness": "not_checked",
     "input_digest": "sha256:40c2720bcd45e015b21194cd5fc3c679836fa5651a0e9d2c34872966778865cb",
-    "policy_revision": "m3-local-lifecycle-1",
+    "policy_revision": "mvp-local-lifecycle-2",
     "executable": false,
     "target_snapshot": "unknown",
     "differences": "unknown",
@@ -292,7 +259,7 @@ driver 오류, 연결 문자열, SQL literal, host 파일 경로, Secret 식별�
       "authentication": "client-certificate"
     },
     "required_capabilities": [
-      "connection.verify.v1"
+      "connection.verify.v2"
     ],
     "next_action": "authorized_read_only_verification",
     "preconditions": [
@@ -313,14 +280,14 @@ driver 오류, 연결 문자열, SQL literal, host 파일 경로, Secret 식별�
       "target_mismatch"
     ],
     "recovery": "no_changes_performed",
-    "plan_digest": "sha256:dcfed9c2e8bd465167f75cb265e676698ad53abeed99933fc0ae78d7caab869b"
+    "plan_digest": "sha256:a188f5b942c6bdb274cec3f8a723ddbb5bf856800ac2ae2cc01c8a207dca1981"
   },
   "errors": []
 }
 ```
 
 구현된 envelope `status`는 `validated`, `planned`, `succeeded`, `failed`다.
-`partial_failure`와 `unknown`은 lifecycle journal의 phase이며 envelope status와 구별한다.
+실패는 추가 journal 상태를 만들지 않으며 마지막 시작·완료 기록을 보존한다.
 `succeeded`는 요청된 scope의 검증 완료만 뜻한다. 검사 항목은 `passed`·`failed`·`not_checked`를 별도 표시한다.
 정상 종료 코드는 0이며 오프라인은 `validated`·`planned`, live 검증 완료는 `succeeded`다.
 실패는 `failed`와 비영 종료를 반환한다. 종료 코드 6–9 및 live 결과는 [로컬 executor 계약](local-executor.md)에 있다.
@@ -328,29 +295,25 @@ driver 오류, 연결 문자열, SQL literal, host 파일 경로, Secret 식별�
 
 오류 예시는 `INVALID_INPUT`, `UNSUPPORTED_OPERATION`, `AUTHORIZATION_REQUIRED`, `TARGET_DRIFT`,
 `TLS_VERIFICATION_FAILED`, `CLIENT_AUTHENTICATION_FAILED`, `PERMISSION_DENIED`, `TIMEOUT`,
-`RECOVERY_REQUIRED`다. 메시지는 고정된 설명과 안전한 다음 동작만 포함한다.
+`PKI_PARTIAL_STATE`, `DELIVERY_PARTIAL_STATE`, `DB_CONFIG_WRITE_FAILED`, `STATE_WRITE_FAILED`다. 메시지는 고정된 설명과 안전한 다음 동작만 포함한다.
 원문 stderr를 보여 주기 위해 재실행하거나 약한 TLS·비밀번호·추가 grant로 우회하지 않는다.
 
-## 7. 로컬 재시도와 일부 실패
+## 7. 오류와 재실행
 
-각 실행에 operation ID를 부여하고 idempotency key를 인증된 주체·대상·계획 digest에 결합한다.
-같은 key에 다른 입력이면 거절한다. 이전 성공은 대상이 여전히 일치할 때 기존 결과로 반환한다.
-발급·전달·reload·전환은 DB transaction 하나로 묶이지 않으므로 단계별 적용·검증·소유 기록을 저장한다.
-일부 적용 후 실패하면 private journal에 `partial_failure`를 기록하고 후속 전환을 멈춘다.
-Timeout·중단으로 외부 작업 완료 여부가 불명확하면 `unknown`이다. 공개 오류에는 phase를 추측하지 않고
-복구 참조만 반환하며, 권한을 확인한 `status`로 기록을 읽는다. 발급·전달을 자동 반복하지 않는다.
-승인된 읽기 전용 상태 대조로 결과를 확정한 뒤에만 재개하거나 담당자 복구 절차로 넘긴다.
+명령은 한 번 실행한다. 실패 시 원래의 고정 오류 코드와 비영 종료를 반환하며 자동 보상 변경·rollback은 없다.
+같은 operation ID로 재실행할 수 있다. 완료 자료는 동일성을 확인하고 재사용하며 중간 파일과 drift는 오류다.
+실패 result는 검증된 `operation_id`, `plan_digest`, `outcome: not_confirmed`만 포함한다.
+오류 원문이나 추측한 완료 단계·다음 복구 동작을 포함하지 않는다. `status`도 fresh 검증이 아니다.
 
-`rollback`은 해당 operation의 승인된 백업과 현재 revision을 대조한다. 다른 실행자의 변경을 덮어쓰지 않는다.
-원래 자격 증명·role·DB·evidence를 자동 삭제하지 않고, 위험한 신규 로그인은 승인된 복구 계획대로 먼저 차단한다.
-복구 실패도 성공으로 포장하지 않으며 정제된 오류와 미확정 복구 참조를 반환한다.
-Traffic/admission 변경이나 그 상태 판정은 현재 로컬 CLI의 지원 범위가 아니다.
+0.4.0 live capability는 v2다. 0.3.0 consumer/작업 계획/전달 store의 자동 호환은 제공하지 않는다.
+M1 JSON envelope major 1과 오프라인 capability는 유지한다. 전체 고정 오류 코드는
+[src/query_passport/contract.py](../src/query_passport/contract.py)의 `ERRORS`가 정의한다.
 
 ## 8. 첫 구현의 완료 기준
 
 M1은 네트워크 없이 위 입력을 `inspect → plan`으로 처리한다. schema·capabilities·safe JSON,
 잘못된 입력·비밀 필드 비노출·source 0개의 의미를 root `tests/`에서 검증했다. live 성공을 주장하지 않는다.
-M2의 실제 `verify`는 별도 승인된 local alias와 disposable fixture로 검증한다. 성공·인증서 거부·timeout·rollback
+M2의 실제 `verify`는 별도 승인된 local alias와 disposable fixture로 검증한다. 성공·인증서 거부·실행 timeout
 결과를 정규화하고, target mismatch와 미승인 접속이 실행 전에 거절됨을 검증한다.
 로컬 스크립트를 감싸 raw 출력만 넘기는 구현은 이 계약을 만족하지 않는다.
 

@@ -126,6 +126,53 @@ def test_admin_scope_is_strict(binding, field, value):
     assert error.value.code == "AUTHORIZATION_REQUIRED"
 
 
+def test_explicit_admin_database_role_preserves_os_identity_and_binding(binding):
+    binding["admin"]["username"] = "query_man_admin"
+    before = copy.deepcopy(binding)
+    validate_lifecycle_binding(binding, REQUEST, "prepare")
+    assert binding == before
+    projected = verification_projection(binding, "/synthetic/bundle")
+    assert projected["username"] == "passport_check" and "admin" not in projected
+
+
+@pytest.mark.parametrize("value", [None, True, "", "-postgres", "postgres;SELECT", "a" * 64])
+def test_admin_database_role_cannot_inject_arguments_or_sql(binding, value):
+    binding["admin"]["username"] = value
+    with pytest.raises(ContractError) as error:
+        validate_lifecycle_binding(binding, REQUEST, "prepare")
+    assert error.value.code == "AUTHORIZATION_REQUIRED"
+
+
+def test_monitoring_review_is_private_and_target_bound(binding):
+    from query_passport.local_lifecycle import binding_digest
+
+    original = binding_digest(binding)
+    binding["admin"]["monitoring"] = {
+        "extension": "pg_stat_statements",
+        "digest": "sha256:" + "a" * 64,
+    }
+    validate_lifecycle_binding(binding, REQUEST, "prepare")
+    assert binding_digest(binding) != original
+    assert "admin" not in verification_projection(binding, "/synthetic/bundle")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        {},
+        {"extension": "other", "digest": "sha256:" + "a" * 64},
+        {"extension": "pg_stat_statements", "digest": "any"},
+        {"extension": "pg_stat_statements", "digest": "sha256:" + "a" * 64, "skip_audit": True},
+    ],
+)
+def test_monitoring_review_cannot_disable_or_generalize_audit(binding, value):
+    binding["admin"]["monitoring"] = value
+    with pytest.raises(ContractError) as error:
+        validate_lifecycle_binding(binding, REQUEST, "prepare")
+    assert error.value.code == "AUTHORIZATION_REQUIRED"
+
+
 def test_private_binding_cannot_authorize_protected_or_other_target(binding):
     request = copy.deepcopy(REQUEST)
     request["profile"]["host"] = "other.example.test"

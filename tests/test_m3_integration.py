@@ -11,7 +11,7 @@ from query_passport import executor
 from query_passport import local_lifecycle as lifecycle
 from query_passport import operation_store as store
 from query_passport.contract import ContractError
-from query_passport.lifecycle_binding import OPERATIONS, verification_projection
+from query_passport.lifecycle_binding import OPERATIONS
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("QUERY_PASSPORT_DOCKER_TESTS") != "1",
@@ -59,11 +59,10 @@ def step(command, target, plan):
     )
 
 
-def test_prepare_issue_apply_deliver_verify_and_owned_rollback(target, monkeypatch):
+def test_prepare_issue_apply_deliver_verify(target, monkeypatch):
     from query_passport import credential_delivery
 
     database, binding = target
-    baseline = database.snapshot()
     assert (
         executor.run_verification(database.existing_binding(), database.request)["status"]
         == "succeeded"
@@ -94,28 +93,8 @@ def test_prepare_issue_apply_deliver_verify_and_owned_rollback(target, monkeypat
     assert candidate.joinpath("client.key").stat().st_uid == 0
     assert candidate.joinpath("client.key").stat().st_gid == 10001
     assert step("status", target, plan)["db_connectivity"] == "not_checked"
-    assert step("rollback", target, plan)["phase"] == "rolled_back"
-    assert step("rollback", target, plan)["phase"] == "rolled_back"
-    assert step("status", target, plan)["phase"] == "rolled_back"
-    assert credential_delivery.inspect_delivery(database.credential_dir)["generation_id"] is None
-    assert candidate.joinpath("client.key").exists()
-    assert database.authority_dir.joinpath("ca.key").exists()
-    assert database.generations_dir.joinpath(plan["operation_id"], "operation.json").exists()
-    assert (
-        executor.run_verification(database.existing_binding(), database.request)["status"]
-        == "succeeded"
-    )
-    rejected = executor.run_verification(
-        verification_projection(binding, str(candidate)), database.request
-    )
-    assert rejected["status"] == "failed" and rejected["error"] == "CLIENT_AUTHENTICATION_FAILED"
     after = database.snapshot()
-    assert after["ssl_ca_file"] == baseline["ssl_ca_file"]
     assert after["existing_roles"] == 1 and after["business_relations"] == 0
-    assert (
-        database.sql("SELECT rolcanlogin::int FROM pg_roles WHERE rolname='passport_check'").strip()
-        == b"0"
-    )
 
 
 def test_drift_after_plan_stops_before_issuance(target):
@@ -146,12 +125,11 @@ def test_uncertain_apply_reconciles_and_reuses_owned_change(target, monkeypatch)
         step("apply", target, plan)
     assert error.value.code == "TIMEOUT"
     with store.operation(plan["operation_id"]) as operation:
-        assert operation.events()[-1]["phase"] == "unknown"
+        assert operation.events()[-1]["phase"] == "applying"
     monkeypatch.setattr(db_admin, "apply", original)
     assert step("apply", target, plan)["phase"] == "applied"
     assert step("deliver", target, plan)["phase"] == "verified"
     assert database.snapshot()["passport_roles"] == 1
-    assert step("rollback", target, plan)["phase"] == "rolled_back"
 
 
 def test_failed_candidate_verification_preserves_inactive_delivery(target, monkeypatch):
@@ -177,7 +155,6 @@ def test_failed_candidate_verification_preserves_inactive_delivery(target, monke
     assert credential_delivery.inspect_delivery(database.credential_dir)["generation_id"] is None
     monkeypatch.setattr(executor, "run_verification", original)
     assert step("deliver", target, plan)["phase"] == "verified"
-    assert step("rollback", target, plan)["phase"] == "rolled_back"
 
 
 def test_public_business_grants_are_reported_without_changing_them(target):
@@ -193,36 +170,7 @@ def test_public_business_grants_are_reported_without_changing_them(target):
     assert database.snapshot()["business_relations"] == 1
 
 
-def test_rollback_preserves_unrelated_later_hba_edit(target):
-    database, binding = target
-    plan = lifecycle.prepare(database.request, binding)
-    step("issue", target, plan)
-    step("apply", target, plan)
-    executor.docker(
-        [
-            "exec",
-            "--user",
-            f"{database.postgres_uid}:{database.postgres_gid}",
-            binding["container_id"],
-            "/bin/sh",
-            "-c",
-            "printf '\\n# independent fixture change\\n' >> /var/lib/postgresql/data/pg_hba.conf",
-        ]
-    )
-    assert step("rollback", target, plan)["phase"] == "rolled_back"
-    kept = database.sql(
-        "SELECT position('# independent fixture change' in pg_read_file(current_setting('hba_file'))) > 0"
-    )
-    assert kept.strip() == b"t"
-    assert (
-        executor.run_verification(database.existing_binding(), database.request)["status"]
-        == "succeeded"
-    )
-    # Only normalized lifecycle observations are intended for the skill.
-    assert "PRIVATE KEY" not in json.dumps(step("status", target, plan))
-
-
-def test_same_path_ca_bundle_drift_stops_delivery_and_can_restore_old_trust(target):
+def test_same_path_ca_bundle_drift_stops_delivery(target):
     database, binding = target
     plan = lifecycle.prepare(database.request, binding)
     step("issue", target, plan)
@@ -252,7 +200,6 @@ def test_same_path_ca_bundle_drift_stops_delivery_and_can_restore_old_trust(targ
         step("deliver", target, plan)
     assert error.value.code == "TARGET_DRIFT"
     assert not database.credential_dir.exists()
-    assert step("rollback", target, plan)["phase"] == "rolled_back"
     assert (
         executor.run_verification(database.existing_binding(), database.request)["status"]
         == "succeeded"
@@ -304,7 +251,6 @@ def test_loaded_trust_policy_is_detected_even_when_disk_rules_are_restored(targe
         step("deliver", target, plan)
     assert error.value.code == "VERIFICATION_FAILED"
     assert credential_delivery.inspect_delivery(database.credential_dir)["generation_id"] is None
-    assert step("rollback", target, plan)["phase"] == "rolled_back"
     assert (
         executor.run_verification(database.existing_binding(), database.request)["status"]
         == "succeeded"

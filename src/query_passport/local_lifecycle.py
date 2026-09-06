@@ -1,8 +1,8 @@
 """Local operation coordinator; all paths and privileges come from operator bindings.
 
 The public CLI dispatches through the closed lifecycle contract. Every mutating
-phase is recorded before the backend is invoked. A timeout
-means unknown external state, not that the database transaction was rolled back.
+command records its start and completion. Errors propagate without compensation;
+a failed command may have already changed external state.
 """
 
 import hashlib
@@ -15,7 +15,15 @@ from pathlib import Path
 from typing import Any
 
 from . import executor, operation_store
-from .contract import ContractError, matches, object_fields, parse_json, require, validate
+from .contract import (
+    PKI_ERRORS,
+    ContractError,
+    matches,
+    object_fields,
+    parse_json,
+    require,
+    validate,
+)
 from .lifecycle_binding import validate_lifecycle_binding, verification_projection
 from .process import run_process
 
@@ -51,9 +59,8 @@ def issuer(binding: dict[str, Any], operation_id: str, input_digest: str) -> dic
             require(code in (0, 1))
             if code == 1:
                 require(value["status"] == "failed" and value["metadata"] == {})
-                # PKI-specific details remain in the issuer; no provider strings
-                # or arbitrary error names become part of the public response.
-                raise ContractError("RECOVERY_REQUIRED")
+                require(type(value["error"]) is str and value["error"] in PKI_ERRORS)
+                raise ContractError(value["error"])
             require(value["status"] == "succeeded" and value["error"] is None)
             metadata = value["metadata"]
             require(type(metadata) is dict)
@@ -69,7 +76,7 @@ def issuer(binding: dict[str, Any], operation_id: str, input_digest: str) -> dic
                     selected[name] = metadata[name]
             return selected
         except ContractError as error:
-            if error.code == "RECOVERY_REQUIRED":
+            if error.code in PKI_ERRORS:
                 raise
             raise ContractError("EXECUTOR_FAILED") from error
 
@@ -209,7 +216,7 @@ def _summary(plan: dict[str, Any], phase: str) -> dict[str, Any]:
         "db_connectivity": "passed" if phase == "verified" else "not_checked",
         "authentication": "passed" if phase == "verified" else "not_checked",
         "target_identity": "passed",
-        "recovery": "owned_changes_only",
+        "recovery": "not_supported",
     }
 
 
@@ -236,7 +243,7 @@ def prepare(
             raise ContractError("TARGET_DRIFT")
         with operation_store.operation() as operation:
             plan = {
-                "version": 1,
+                "version": 2,
                 "operation_id": operation.operation_id,
                 "intent": intent,
                 "request": request,
@@ -288,8 +295,6 @@ def _load_plan(
     request: dict[str, Any],
     binding: dict[str, Any],
     plan_digest: str,
-    *,
-    allow_retired: bool = False,
 ) -> dict[str, Any]:
     plan = parse_json(operation.read_artifact("plan.json"))
     object_fields(
@@ -307,7 +312,7 @@ def _load_plan(
         {"rotation"},
     )
     if (
-        plan["version"] != 1
+        plan["version"] != 2
         or type(plan["version"]) is not int
         or plan["operation_id"] != operation.operation_id
         or plan["intent"] not in ("provision", "rotate")
@@ -317,10 +322,8 @@ def _load_plan(
         or digest(plan) != plan_digest
     ):
         raise ContractError("TARGET_DRIFT")
-    if not operation.events() or (
-        not allow_retired and any(event["phase"] == "rolled_back" for event in operation.events())
-    ):
-        raise ContractError("RECOVERY_REQUIRED")
+    if not operation.events():
+        raise ContractError("OPERATION_ORDER_INVALID")
     if executor.target_snapshot(binding) != plan["target_snapshot"]:
         raise ContractError("TARGET_DRIFT")
     return dict(plan)
@@ -349,12 +352,12 @@ def _prepare_rotation(
 
     previous_id = previous["generation_id"]
     if previous_id is None:
-        raise ContractError("RECOVERY_REQUIRED")
+        raise ContractError("OPERATION_ORDER_INVALID")
     with operation_store.operation(previous_id) as predecessor:
         stored = parse_json(predecessor.read_artifact("plan.json"))
         old_plan = _load_plan(predecessor, request, binding, digest(stored))
         if predecessor.events()[-1]["phase"] != "verified":
-            raise ContractError("RECOVERY_REQUIRED")
+            raise ContractError("OPERATION_ORDER_INVALID")
         if parse_json(predecessor.read_artifact("delivery.json")) != previous:
             raise ContractError("TARGET_DRIFT")
         issuance = parse_json(predecessor.read_artifact("issuance.json"))
@@ -362,7 +365,6 @@ def _prepare_rotation(
         rotation = {
             "owner_operation_id": old_owner.get("owner_operation_id", previous_id),
             "owner_plan_digest": old_owner.get("owner_plan_digest", digest(old_plan)),
-            "predecessor_plan_digest": digest(old_plan),
             "authority_sha256": issuance["authority_sha256"],
             "server_ca_sha256": issuance["server_ca_sha256"],
         }
@@ -374,14 +376,13 @@ def _prepare_rotation(
 def _rotation_owner(
     request: dict[str, Any], binding: dict[str, Any], plan: dict[str, Any]
 ) -> dict[str, Any]:
-    """Resolve a verified predecessor and its original DB owner without copying history."""
+    """Validate the original DB configuration owner for this certificate renewal."""
     rotation = plan["rotation"]
     object_fields(
         rotation,
         {
             "owner_operation_id",
             "owner_plan_digest",
-            "predecessor_plan_digest",
             "authority_sha256",
             "server_ca_sha256",
         },
@@ -389,7 +390,6 @@ def _rotation_owner(
     require(matches(rotation["owner_operation_id"], r"[a-f0-9]{32}", 32))
     for name in (
         "owner_plan_digest",
-        "predecessor_plan_digest",
         "authority_sha256",
         "server_ca_sha256",
     ):
@@ -397,16 +397,10 @@ def _rotation_owner(
     previous_id = plan["previous"]["generation_id"]
     require(matches(previous_id, r"[a-f0-9]{32}", 32))
     require(plan.get("operation_id") not in {previous_id, rotation["owner_operation_id"]})
-    with operation_store.operation(previous_id) as predecessor:
-        _load_plan(predecessor, request, binding, rotation["predecessor_plan_digest"])
-        if predecessor.events()[-1]["phase"] != "verified":
-            raise ContractError("RECOVERY_REQUIRED")
-        if parse_json(predecessor.read_artifact("delivery.json")) != plan["previous"]:
-            raise ContractError("TARGET_DRIFT")
     with operation_store.operation(rotation["owner_operation_id"]) as original:
         owner = _load_plan(original, request, binding, rotation["owner_plan_digest"])
         if owner["intent"] != "provision" or original.events()[-1]["phase"] != "verified":
-            raise ContractError("RECOVERY_REQUIRED")
+            raise ContractError("OPERATION_ORDER_INVALID")
         issuance = parse_json(original.read_artifact("issuance.json"))
         if any(
             issuance[name] != rotation[name] for name in ("authority_sha256", "server_ca_sha256")
@@ -446,38 +440,22 @@ def _deliver_generation(
 
     db_admin.verify_applied(binding, applied_plan, applied_plan["operation_id"])
     _save_once(operation, "issuance.json", issuer(binding, operation.operation_id, digest(plan)))
-    boundary_failure = None
 
     def verify_candidate(candidate: Path) -> None:
-        nonlocal boundary_failure
-        try:
-            _verify_generation(operation, request, binding, applied_plan, candidate)
-        except ContractError as error:
-            boundary_failure = error.code
-            raise
+        _verify_generation(operation, request, binding, applied_plan, candidate)
 
     def permissions(candidate: Path) -> None:
-        nonlocal boundary_failure
-        try:
-            set_runtime_permissions(binding, candidate)
-        except ContractError as error:
-            boundary_failure = error.code
-            raise
+        set_runtime_permissions(binding, candidate)
 
     operation.record("delivering")
-    try:
-        delivered = credential_delivery.deliver(
-            Path(binding["lifecycle"]["generations_dir"]) / operation.operation_id / "bundle",
-            Path(binding["credential_dir"]),
-            operation.operation_id,
-            expected_revision=plan["previous"],
-            permission_setter=permissions,
-            validator=verify_candidate,
-        )
-    except Exception:
-        if boundary_failure is not None:
-            raise ContractError(boundary_failure) from None
-        raise
+    delivered = credential_delivery.deliver(
+        Path(binding["lifecycle"]["generations_dir"]) / operation.operation_id / "bundle",
+        Path(binding["credential_dir"]),
+        operation.operation_id,
+        expected_revision=plan["previous"],
+        permission_setter=permissions,
+        validator=verify_candidate,
+    )
     _save_once(
         operation,
         "delivery.json",
@@ -486,18 +464,7 @@ def _deliver_generation(
     operation.record("delivered")
 
 
-def _check_rollback_pointer(plan: dict[str, Any], binding: dict[str, Any]) -> None:
-    from . import credential_delivery
-
-    active = credential_delivery.inspect_delivery(Path(binding["credential_dir"]))
-    if active["generation_id"] not in {plan["operation_id"], plan["previous"]["generation_id"]}:
-        # An older operation must not disable the account used by a newer active
-        # generation. Revert child rotations in order before the original DB plan.
-        raise ContractError("TARGET_DRIFT")
-
-
-def _execute_rotation(
-    command: str,
+def _rotate(
     operation: operation_store.Operation,
     plan: dict[str, Any],
     request: dict[str, Any],
@@ -505,63 +472,29 @@ def _execute_rotation(
 ) -> dict[str, Any]:
     from . import credential_delivery, db_admin
 
-    if command not in {"rotate", "rollback"}:
-        raise ContractError("UNSUPPORTED_OPERATION")
-    phases = {event["phase"] for event in operation.events()}
-    _check_rollback_pointer(plan, binding)
-    if command != "rollback" and "rolling_back" in phases:
-        raise ContractError("RECOVERY_REQUIRED")
+    active = credential_delivery.inspect_delivery(Path(binding["credential_dir"]))
+    if active != plan["previous"] and active["generation_id"] != operation.operation_id:
+        raise ContractError("TARGET_DRIFT")
     owner = _rotation_owner(request, binding, plan)
     db_admin.verify_applied(binding, owner, owner["operation_id"])
-    operation.record("rolling_back" if command == "rollback" else "issuing")
-    try:
-        if command == "rotate":
-            if db_admin.snapshot(binding) != plan["before"]:
-                raise ContractError("TARGET_DRIFT")
-            metadata = issuer(binding, operation.operation_id, digest(plan))
-            if any(
-                metadata[name] != plan["rotation"][name]
-                for name in ("authority_sha256", "server_ca_sha256")
-            ):
-                raise ContractError("TARGET_DRIFT")
-            if metadata["certificate_sha256"] == plan["previous"]["certificate_sha256"]:
-                raise ContractError("VERIFICATION_FAILED")
-            _save_once(operation, "issuance.json", metadata)
-            operation.record("issued")
-            operation.record("checking_delivery")
-            _deliver_generation(operation, plan, request, binding, owner)
-            phase = "verified"
-        else:
-            if "delivering" in phases:
-                candidate = (
-                    Path(binding["credential_dir"])
-                    / "versions"
-                    / plan["previous"]["generation_id"]
-                    / "bundle"
-                )
-                _verify_generation(operation, request, binding, owner, candidate)
-                credential_delivery.rollback(
-                    Path(binding["credential_dir"]), operation.operation_id, plan["previous"]
-                )
-            phase = "rolled_back"
-        if executor.target_snapshot(binding) != plan["target_snapshot"]:
-            raise ContractError("TARGET_DRIFT")
-        operation.record(phase)
-        return _summary(plan, phase)
-    except BaseException as error:
-        code = (
-            error.code
-            if isinstance(error, ContractError)
-            else "INTERRUPTED"
-            if isinstance(error, (KeyboardInterrupt, SystemExit))
-            else "RECOVERY_REQUIRED"
-        )
-        operation.record(
-            "unknown" if code in {"TIMEOUT", "INTERRUPTED"} else "partial_failure", code
-        )
-        if isinstance(error, (KeyboardInterrupt, SystemExit)):
-            raise
-        raise ContractError(code) from None
+    if db_admin.snapshot(binding) != plan["before"]:
+        raise ContractError("TARGET_DRIFT")
+    operation.record("issuing")
+    metadata = issuer(binding, operation.operation_id, digest(plan))
+    if any(
+        metadata[name] != plan["rotation"][name]
+        for name in ("authority_sha256", "server_ca_sha256")
+    ):
+        raise ContractError("TARGET_DRIFT")
+    if metadata["certificate_sha256"] == plan["previous"]["certificate_sha256"]:
+        raise ContractError("VERIFICATION_FAILED")
+    _save_once(operation, "issuance.json", metadata)
+    operation.record("issued")
+    _deliver_generation(operation, plan, request, binding, owner)
+    if executor.target_snapshot(binding) != plan["target_snapshot"]:
+        raise ContractError("TARGET_DRIFT")
+    operation.record("verified")
+    return _summary(plan, "verified")
 
 
 def execute(
@@ -571,111 +504,59 @@ def execute(
     operation_id: str,
     plan_digest: str,
 ) -> dict[str, Any]:
-    """Resume one explicit phase after reconciling its owned state.
-
-    Return values contain no private paths, configuration text or issuer output.
-    Reissuing uses the same generation ID; failed apply/delivery never silently
-    proceeds to a later phase and rollback cannot reactivate a retired operation.
-    """
-    from . import credential_delivery, db_admin
+    """Run the requested step once. Backend errors propagate without recovery."""
+    from . import db_admin
 
     request = validate(request)
+    if command not in {"issue", "apply", "deliver", "rotate", "status"}:
+        raise ContractError("UNSUPPORTED_OPERATION")
     validate_lifecycle_binding(binding, request, command)
-    require(command in {"issue", "apply", "deliver", "rotate", "rollback", "status"})
     require(matches(operation_id, r"[a-f0-9]{32}", 32))
     require(matches(plan_digest, r"sha256:[a-f0-9]{64}", 71))
     with operation_store.target_lock(binding["container_id"]):
         with operation_store.operation(operation_id) as operation:
-            plan = _load_plan(
-                operation,
-                request,
-                binding,
-                plan_digest,
-                allow_retired=command in {"rollback", "status"},
-            )
+            plan = _load_plan(operation, request, binding, plan_digest)
             phases = {event["phase"] for event in operation.events()}
             if command == "status":
-                # Historical observations only; this is not a fresh DB verification.
                 result = _summary(plan, operation.events()[-1]["phase"])
                 for field in ("db_connectivity", "authentication", "certificate_validation"):
                     result[field] = "not_checked"
                 return result
             if plan["intent"] == "rotate":
-                return _execute_rotation(command, operation, plan, request, binding)
+                if command != "rotate":
+                    raise ContractError("UNSUPPORTED_OPERATION")
+                return _rotate(operation, plan, request, binding)
             if command == "rotate":
                 raise ContractError("UNSUPPORTED_OPERATION")
-            if command == "rollback" and "delivering" in phases:
-                _check_rollback_pointer(plan, binding)
-            stage = {
-                "issue": "issuing",
-                "apply": "applying",
-                "deliver": "checking_delivery",
-                "rollback": "rolling_back",
-            }[command]
-            if command == "apply" and "issued" not in phases:
-                raise ContractError("RECOVERY_REQUIRED")
-            if command == "deliver" and "applied" not in phases:
-                raise ContractError("RECOVERY_REQUIRED")
-            if command == "apply" and phases & {"delivering", "delivered", "verified"}:
-                raise ContractError("RECOVERY_REQUIRED")
-            if command == "issue" and phases & {
-                "applying",
-                "applied",
-                "delivering",
-                "delivered",
-                "verified",
-                "rolling_back",
-            }:
-                raise ContractError("RECOVERY_REQUIRED")
-            if command != "rollback" and "rolling_back" in phases:
-                raise ContractError("RECOVERY_REQUIRED")
-            operation.record(stage)
-            try:
-                if command == "issue":
-                    if db_admin.snapshot(binding) != plan["before"]:
-                        raise ContractError("TARGET_DRIFT")
-                    metadata = issuer(binding, operation_id, digest(plan))
-                    _save_once(operation, "issuance.json", metadata)
-                    phase = "issued"
-                elif command == "apply":
-                    metadata = parse_json(operation.read_artifact("issuance.json"))
-                    trust = client_trust(binding, metadata["authority_sha256"])
-                    if "applied" not in phases:
-                        applied = db_admin.apply(binding, plan, operation_id, trust)
-                        require(matches(applied["ca_digest"], r"sha256:[a-f0-9]{64}", 71))
-                        _save_once(
-                            operation, "db.applied.json", {"ca_digest": applied["ca_digest"]}
-                        )
-                    db_admin.verify_applied(binding, _applied_plan(operation, plan), operation_id)
-                    phase = "applied"
-                elif command == "deliver":
-                    _deliver_generation(
-                        operation, plan, request, binding, _applied_plan(operation, plan)
-                    )
-                    phase = "verified"
-                else:
-                    if "applying" in phases:
-                        db_admin.rollback(binding, plan, operation_id)
-                    if "delivering" in phases:
-                        credential_delivery.rollback(
-                            Path(binding["credential_dir"]), operation_id, plan["previous"]
-                        )
-                    phase = "rolled_back"
-                if executor.target_snapshot(binding) != plan["target_snapshot"]:
+            if (
+                (command == "issue" and "applying" in phases)
+                or (command == "apply" and ("issued" not in phases or "delivering" in phases))
+                or (command == "deliver" and "applied" not in phases)
+            ):
+                raise ContractError("OPERATION_ORDER_INVALID")
+            operation.record(
+                {"issue": "issuing", "apply": "applying", "deliver": "checking_delivery"}[command]
+            )
+            if command == "issue":
+                if db_admin.snapshot(binding) != plan["before"]:
                     raise ContractError("TARGET_DRIFT")
-                operation.record(phase)
-                return _summary(plan, phase)
-            except BaseException as error:
-                code = (
-                    error.code
-                    if isinstance(error, ContractError)
-                    else "INTERRUPTED"
-                    if isinstance(error, (KeyboardInterrupt, SystemExit))
-                    else "RECOVERY_REQUIRED"
+                _save_once(operation, "issuance.json", issuer(binding, operation_id, digest(plan)))
+                phase = "issued"
+            elif command == "apply":
+                metadata = parse_json(operation.read_artifact("issuance.json"))
+                trust = client_trust(binding, metadata["authority_sha256"])
+                if "db.applied.json" not in os.listdir(operation.directory):
+                    applied = db_admin.apply(binding, plan, operation_id, trust)
+                    require(matches(applied["ca_digest"], r"sha256:[a-f0-9]{64}", 71))
+                    _save_once(operation, "db.applied.json", {"ca_digest": applied["ca_digest"]})
+                db_admin.verify_applied(binding, _applied_plan(operation, plan), operation_id)
+                phase = "applied"
+            else:
+                _deliver_generation(
+                    operation, plan, request, binding, _applied_plan(operation, plan)
                 )
-                operation.record(
-                    "unknown" if code in {"TIMEOUT", "INTERRUPTED"} else "partial_failure", code
-                )
-                if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                    raise
-                raise ContractError(code) from None
+                phase = "verified"
+            if executor.target_snapshot(binding) != plan["target_snapshot"]:
+                raise ContractError("TARGET_DRIFT")
+            operation.record(phase)
+            return _summary(plan, phase)

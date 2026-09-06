@@ -142,7 +142,7 @@ def own_operator_binding(binding):
             os.close(descriptor)
 
 
-def test_actual_query_man_runtime_verifies_tls_identity_timeout_cancel_and_reconnect(database):
+def test_actual_query_man_runtime_verifies_tls_identity_and_read_only_connection(database):
     validate_binding(database.binding, database.request)
     snapshot = target_snapshot(database.binding)
     result = run_verification(database.binding, database.request)
@@ -212,7 +212,7 @@ def test_real_bad_credentials_and_unauthorized_targets_fail_closed(database, pro
     result = run_verification(binding, request)
     assert result["status"] == "failed"
     assert result["error"] == expected
-    assert result["checks"]["reconnect"] == "not_checked"
+    assert result["checks"]["read_only_transaction"] == "not_checked"
     serialized = json.dumps(result)
     for forbidden in (
         "BEGIN CERTIFICATE",
@@ -325,7 +325,7 @@ def test_installed_wheel_cli_uses_real_operator_binding_and_safe_live_json(
     capability = json.loads(capability_process.stdout)
     assert capability["contract_version"] == "1"
     assert 1 in capability["result"]["supported_contract_majors"]
-    assert "connection.verify.v1" in capability["result"]["capabilities"]
+    assert "connection.verify.v2" in capability["result"]["capabilities"]
     binding, request = database.for_probe(probe)
     request["target_alias"] = "fixture-cli-" + uuid.uuid4().hex
     binding["request"] = copy.deepcopy(request)

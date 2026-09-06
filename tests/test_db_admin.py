@@ -238,11 +238,11 @@ def test_login_is_last_after_owned_rules_ca_and_reload(simulated):
         "enable",
     ],
 )
-def test_partial_failures_close_owned_role_and_resume_without_duplicate_creation(simulated, phase):
+def test_partial_failure_returns_original_error_and_rerun_avoids_duplicate_role(simulated, phase):
     simulated.fail_phase = phase
     with pytest.raises(ContractError) as caught:
         provision(simulated)
-    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert caught.value.code == "EXECUTOR_FAILED"
     assert simulated.current["role"]["login"] is False
     assert provision(simulated)["status"] == "applied"
     assert simulated.events.count("create-nologin") == 1
@@ -303,8 +303,6 @@ def test_foreign_existing_role_is_not_altered(simulated):
     assert caught.value.code == "PERMISSION_DENIED"
     assert simulated.current["role"]["login"] is True
     assert "disable" not in simulated.events
-    with pytest.raises(ContractError):
-        admin.rollback(simulated.binding, simulated.plan, OPERATION)
     assert simulated.current["role"]["login"] is True
 
 
@@ -332,62 +330,6 @@ def test_unsafe_owned_role_cannot_be_resumed(simulated, field, value):
         provision(simulated)
     assert caught.value.code == "PERMISSION_DENIED"
     assert "enable" not in simulated.events
-
-
-def test_rollback_preserves_unrelated_changes_and_retains_own_identity(simulated):
-    provision(simulated)
-    simulated.current["hba"] = (
-        "# another DBA comment\n" + simulated.current["hba"] + "\n# new final line"
-    )
-    simulated.current["ident"] += "# another map comment\n"
-    simulated.auto_base = "sha256:" + "3" * 64
-    start = len(simulated.events)
-    result = admin.rollback(simulated.binding, simulated.plan, OPERATION)
-    assert result["status"] == "rolled_back" and result["role"] == "nologin_retained"
-    assert simulated.events[start] == "disable"
-    assert (
-        simulated.current["hba"]
-        == "# another DBA comment\n" + simulated.original["hba"] + "\n# new final line"
-    )
-    assert simulated.current["ident"] == simulated.original["ident"] + "# another map comment\n"
-    assert simulated.current["role"]["login"] is False and simulated.ca_installed
-    assert simulated.current["auto_digest"] == simulated.auto_base
-    assert admin.rollback(simulated.binding, simulated.plan, OPERATION)["status"] == "rolled_back"
-
-
-def test_rollback_will_not_overwrite_changed_owned_block(simulated):
-    provision(simulated)
-    simulated.current["hba"] = simulated.current["hba"].replace(
-        "cert clientname=DN", "trust # clientname=DN"
-    )
-    changed = simulated.current["hba"]
-    with pytest.raises(ContractError) as caught:
-        admin.rollback(simulated.binding, simulated.plan, OPERATION)
-    assert caught.value.code == "RECOVERY_REQUIRED"
-    assert simulated.current["hba"] == changed and simulated.current["role"]["login"] is False
-
-
-def test_rollback_closes_owned_login_before_rejecting_malformed_configuration(simulated):
-    provision(simulated)
-    simulated.current["parse_ok"] = False
-    hba = simulated.current["hba"]
-    ident = simulated.current["ident"]
-    with pytest.raises(ContractError) as caught:
-        admin.rollback(simulated.binding, simulated.plan, OPERATION)
-    assert caught.value.code == "RECOVERY_REQUIRED"
-    assert simulated.current["role"]["login"] is False
-    assert simulated.current["hba"] == hba
-    assert simulated.current["ident"] == ident
-
-
-@pytest.mark.parametrize("failure", [ContractError("TIMEOUT"), KeyboardInterrupt(), SystemExit(1)])
-def test_rollback_uncertainty_is_not_converted_to_partial_failure(simulated, failure):
-    provision(simulated)
-    simulated.fail_phase = "replace-hba"
-    simulated.failure = failure
-    with pytest.raises(type(failure)) as caught:
-        admin.rollback(simulated.binding, simulated.plan, OPERATION)
-    assert caught.value is failure and simulated.current["role"]["login"] is False
 
 
 def test_verify_requires_persisted_trust_digest_and_rejects_same_path_trust_drift(simulated):
@@ -459,22 +401,91 @@ def test_internal_binding_values_cannot_become_shell_or_sql(field, value):
         admin._binding(request)
 
 
-def test_psql_transport_uses_fixed_socket_argv_and_stdin(monkeypatch):
+@pytest.mark.parametrize("username", [None, "query_man_admin"])
+def test_psql_transport_uses_fixed_socket_argv_and_stdin(monkeypatch, username):
     observed = []
+    configured = binding()
+    if username is not None:
+        configured["admin"]["username"] = username
+    initial = copy.deepcopy(configured)
 
     def docker(args, **kwargs):
         observed.append((args, kwargs))
         return b'{"ok":true}\n'
 
     monkeypatch.setattr(admin.executor, "docker", docker)
-    assert admin._sql(binding(), "SELECT json_build_object('ok',true);") == {"ok": True}
+    assert admin._sql(configured, "SELECT json_build_object('ok',true);") == {"ok": True}
     args, options = observed[0]
     assert "--no-psqlrc" in args and "--no-password" in args
     assert args[args.index("--host") + 1] == "/var/run/postgresql"
-    assert args[args.index("--username") + 1] == "postgres"
+    assert args[args.index("--username") + 1] == (username or "postgres")
+    assert args[args.index("--user") + 1] == (
+        f"{configured['admin']['uid']}:{configured['admin']['gid']}"
+    )
     assert args[-2:] == ["--file", "-"]
     assert b"SET log_statement = 'none'" in options["stdin"]
     assert all("SELECT" not in part for part in args)
+    assert configured == initial
+
+
+@pytest.mark.parametrize("username", [None, "query_man_admin"])
+def test_admin_username_normalization_changes_only_internal_return_copy(username):
+    configured = binding()
+    if username is not None:
+        configured["admin"]["username"] = username
+    original = copy.deepcopy(configured)
+    normalized = admin._binding(configured)
+    assert normalized["username"] == (username or "postgres")
+    assert normalized is not configured["admin"]
+    assert configured == original
+
+
+@pytest.mark.parametrize(
+    "username",
+    [None, True, 1, [], {}, "", "Query_Admin", "admin-user", "user;select", "user\n", "a" * 64],
+)
+def test_admin_username_rejects_unsafe_values_before_executor(username, monkeypatch):
+    configured = binding()
+    configured["admin"]["username"] = username
+    monkeypatch.setattr(admin.executor, "docker", lambda *_a, **_k: pytest.fail("No execution"))
+    with pytest.raises(ContractError) as caught:
+        admin._sql(configured, "SELECT 1;")
+    assert caught.value.code == "AUTHORIZATION_REQUIRED"
+
+
+@pytest.mark.parametrize("username", [None, "query_man_admin"])
+def test_snapshot_admin_predicate_binds_both_identities_and_superuser(monkeypatch, username):
+    configured = binding()
+    if username is not None:
+        configured["admin"]["username"] = username
+    observed = before()
+    observed.pop("target_snapshot")
+    statements = []
+
+    def sql(_binding, statement):
+        statements.append(statement)
+        return copy.deepcopy(observed)
+
+    monkeypatch.setattr(admin, "_sql", sql)
+    monkeypatch.setattr(admin.executor, "target_snapshot", lambda _: TARGET)
+    assert admin.snapshot(configured)["admin"] is True
+    predicate = statements[0].split("'admin',", 1)[1].split("'ssl',", 1)[0]
+    expected = username or "postgres"
+    assert f"current_user = '{expected}' AND session_user = '{expected}'" in predicate
+    assert "FROM pg_roles WHERE rolname=current_user AND rolsuper" in predicate
+
+
+@pytest.mark.parametrize("refused_admin", [False, None, "true", 1])
+def test_unconfirmed_admin_identity_or_superuser_cannot_prepare_or_apply(simulated, refused_admin):
+    # The fixed SQL predicate is false for a different session/current role or a
+    # non-superuser; no truthy malformed catalog result may authorize mutation.
+    simulated.current["admin"] = refused_admin
+    with pytest.raises(ContractError) as caught:
+        admin.validate_provision(simulated.binding, simulated.current)
+    assert caught.value.code == "UNSUPPORTED_OPERATION"
+    with pytest.raises(ContractError):
+        provision(simulated)
+    assert "create-nologin" not in simulated.events
 
 
 def test_snapshot_is_observational_for_existing_roles(monkeypatch):
@@ -539,3 +550,193 @@ def test_result_never_contains_private_configuration(simulated):
     encoded = json.dumps(result)
     assert "pg_hba" not in encoded and "client-ca" not in encoded and "192.0.2" not in encoded
     assert "query_man" not in encoded and "passport_check" not in encoded
+
+
+MONITORING_DIGEST = "sha256:" + "1" * 64
+
+
+def enable_monitoring(server):
+    server.binding["admin"]["monitoring"] = {
+        "extension": "pg_stat_statements",
+        "digest": MONITORING_DIGEST,
+    }
+    for observed in (server.original, server.plan["before"], server.current):
+        observed["monitoring"] = {"valid": True, "digest": MONITORING_DIGEST}
+
+
+@pytest.mark.parametrize(
+    "monitoring",
+    [
+        None,
+        True,
+        [],
+        {},
+        {"extension": "pg_stat_statements"},
+        {"digest": MONITORING_DIGEST},
+        {"extension": "another_extension", "digest": MONITORING_DIGEST},
+        {"extension": "pg_stat_statements", "digest": "sha256:" + "A" * 64},
+        {"extension": "pg_stat_statements", "digest": MONITORING_DIGEST + "\n"},
+        {"extension": "pg_stat_statements", "digest": True},
+        {"extension": "pg_stat_statements", "digest": MONITORING_DIGEST, "objects": [CANARY]},
+    ],
+)
+def test_monitoring_policy_is_closed_and_rejected_before_executor(monitoring, monkeypatch):
+    configured = binding()
+    configured["admin"]["monitoring"] = monitoring
+    monkeypatch.setattr(admin.executor, "docker", lambda *_a, **_k: pytest.fail("No execution"))
+    with pytest.raises(ContractError) as caught:
+        admin._sql(configured, "SELECT 1;")
+    assert caught.value.code == "AUTHORIZATION_REQUIRED"
+    assert CANARY not in str(caught.value)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_monitoring_and_permission_audit_share_one_snapshot_and_do_not_return_definitions(
+    monkeypatch, enabled
+):
+    configured = binding()
+    observed = before()
+    observed.pop("target_snapshot")
+    if enabled:
+        configured["admin"]["monitoring"] = {
+            "extension": "pg_stat_statements",
+            "digest": MONITORING_DIGEST,
+        }
+        observed["monitoring"] = {"valid": True, "digest": MONITORING_DIGEST}
+    original = copy.deepcopy(configured)
+    statements = []
+
+    def sql(_binding, statement):
+        statements.append(statement)
+        return copy.deepcopy(observed)
+
+    monkeypatch.setattr(admin, "_sql", sql)
+    monkeypatch.setattr(admin.executor, "target_snapshot", lambda _: TARGET)
+    result = admin.snapshot(configured)
+    assert len(statements) == 1 and configured == original
+    statement = statements[0]
+    if enabled:
+        assert statement.count("WITH passport_extension AS MATERIALIZED") == 1
+        assert statement.count("c.oid IN (SELECT oid FROM passport_views)") == 2
+        assert statement.count("p.oid IN (SELECT oid FROM passport_functions)") == 2
+        assert result["monitoring"] == {"valid": True, "digest": MONITORING_DIGEST}
+        assert "definition" not in json.dumps(result)
+    else:
+        assert "passport_monitoring" not in statement
+        assert "pg_get_functiondef" not in statement
+        assert "monitoring" not in result
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        {},
+        {"valid": True},
+        {"valid": 1, "digest": MONITORING_DIGEST},
+        {"valid": True, "digest": CANARY},
+        {"valid": True, "digest": MONITORING_DIGEST, "definition": CANARY},
+    ],
+)
+def test_snapshot_never_accepts_malformed_or_raw_monitoring_metadata(monkeypatch, value):
+    configured = binding()
+    configured["admin"]["monitoring"] = {
+        "extension": "pg_stat_statements",
+        "digest": MONITORING_DIGEST,
+    }
+    observed = before()
+    observed.pop("target_snapshot")
+    observed["monitoring"] = value
+    monkeypatch.setattr(admin, "_sql", lambda *_: observed)
+    monkeypatch.setattr(admin.executor, "target_snapshot", lambda _: TARGET)
+    with pytest.raises(ContractError) as caught:
+        admin.snapshot(configured)
+    assert caught.value.code == "EXECUTOR_FAILED" and CANARY not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        {"valid": False, "digest": MONITORING_DIGEST},
+        {"valid": 1, "digest": MONITORING_DIGEST},
+        {"valid": True, "digest": "sha256:" + "2" * 64},
+    ],
+)
+def test_unapproved_or_changed_monitoring_snapshot_cannot_start_mutation(simulated, value):
+    enable_monitoring(simulated)
+    if value is None:
+        del simulated.current["monitoring"]
+    else:
+        simulated.current["monitoring"] = value
+    with pytest.raises(ContractError) as caught:
+        provision(simulated)
+    assert caught.value.code == "TARGET_DRIFT"
+    assert "create-nologin" not in simulated.events
+
+
+def test_approved_monitoring_is_not_adopted_without_explicit_binding(simulated):
+    simulated.plan["before"]["monitoring"] = {"valid": True, "digest": MONITORING_DIGEST}
+    with pytest.raises(ContractError) as caught:
+        provision(simulated)
+    assert caught.value.code == "TARGET_DRIFT" and simulated.events == []
+
+
+@pytest.mark.parametrize("audit_field", sorted(admin._AUDIT_FIELDS))
+def test_monitoring_pin_does_not_bypass_other_public_or_own_role_permissions(
+    simulated, audit_field
+):
+    enable_monitoring(simulated)
+    simulated.current["public_audit"][audit_field] = True
+    with pytest.raises(ContractError) as caught:
+        provision(simulated)
+    assert caught.value.code == "PERMISSION_DENIED"
+    assert "create-nologin" not in simulated.events
+    simulated.current["public_audit"][audit_field] = False
+    simulated.current["role"] = own_role()
+    simulated.current["role"]["audit"][audit_field] = True
+    with pytest.raises(ContractError) as caught:
+        provision(simulated)
+    assert caught.value.code == "PERMISSION_DENIED"
+    assert "enable" not in simulated.events
+
+
+def test_monitoring_drift_after_reload_keeps_owned_role_closed(simulated, monkeypatch):
+    enable_monitoring(simulated)
+
+    def drift(_binding, expected_ca):
+        simulated.reload(_binding, expected_ca)
+        simulated.current["monitoring"]["digest"] = "sha256:" + "2" * 64
+
+    monkeypatch.setattr(admin, "_reload", drift)
+    with pytest.raises(ContractError) as caught:
+        provision(simulated)
+    assert caught.value.code == "TARGET_DRIFT"
+    assert simulated.current["role"]["login"] is False
+    assert "enable" not in simulated.events
+
+
+def test_monitoring_pin_is_rechecked_before_delivery_verification(simulated):
+    enable_monitoring(simulated)
+    result = provision(simulated)
+    assert result["status"] == "applied" and "monitoring" not in result
+    receipt = {**simulated.plan, "applied_ca_digest": CA_DIGEST}
+    simulated.current["monitoring"]["digest"] = "sha256:" + "2" * 64
+    with pytest.raises(ContractError) as caught:
+        admin.verify_applied(simulated.binding, receipt, OPERATION)
+    assert caught.value.code == "TARGET_DRIFT"
+
+
+def test_error_after_login_does_not_run_compensating_database_changes(simulated, monkeypatch):
+    failure = ContractError("TARGET_DRIFT")
+
+    def failed_verification(*args):
+        raise failure
+
+    monkeypatch.setattr(admin, "verify_applied", failed_verification)
+    with pytest.raises(ContractError) as caught:
+        provision(simulated)
+    assert caught.value is failure
+    assert simulated.current["role"]["login"] is True
+    assert simulated.events[-1] == "enable"
+    assert "disable" not in simulated.events

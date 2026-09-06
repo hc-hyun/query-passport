@@ -411,7 +411,7 @@ def test_cleanup_must_prove_fresh_container_absent(binding, monkeypatch, cleanup
     else:
         with pytest.raises(ContractError) as error:
             runner.run_policy_verification(binding, REQUEST)
-        assert error.value.code == "RECOVERY_REQUIRED"
+        assert error.value.code == "EXECUTOR_CLEANUP_FAILED"
     assert calls[-1][0][0] == "ps"
 
 
@@ -449,7 +449,13 @@ def test_failed_result_preserves_only_fixed_classification():
 
 @pytest.mark.parametrize(
     "failure",
-    [ContractError("TIMEOUT"), ContractError("INTERRUPTED"), KeyboardInterrupt(), SystemExit(1)],
+    [
+        ContractError("TIMEOUT"),
+        ContractError("INTERRUPTED"),
+        ContractError("CLIENT_AUTHENTICATION_FAILED"),
+        KeyboardInterrupt(),
+        SystemExit(1),
+    ],
 )
 @pytest.mark.parametrize("cleanup", ["remaining", "observation_failed", "interrupted"])
 def test_policy_probe_uncertainty_survives_docker_cleanup(binding, monkeypatch, failure, cleanup):

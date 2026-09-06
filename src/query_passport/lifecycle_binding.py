@@ -11,9 +11,7 @@ from typing import Any
 from .contract import ContractError, matches, object_fields, require
 from .executor import validate_binding
 
-OPERATIONS = frozenset(
-    {"verify", "prepare", "issue", "apply", "deliver", "rotate", "rollback", "status"}
-)
+OPERATIONS = frozenset({"verify", "prepare", "issue", "apply", "deliver", "rotate", "status"})
 
 
 def verification_projection(binding: dict[str, Any], credential_dir: str) -> dict[str, Any]:
@@ -54,8 +52,16 @@ def validate_lifecycle_binding(binding: Any, request: dict[str, Any], operation:
         require(required <= set(operations))
         admin = binding["admin"]
         object_fields(
-            admin, {"uid", "gid", "socket_directory", "pgdata", "network_cidr", "connection_limit"}
+            admin,
+            {"uid", "gid", "socket_directory", "pgdata", "network_cidr", "connection_limit"},
+            {"username", "monitoring"},
         )
+        require(matches(admin.get("username", "postgres"), r"[a-z_][a-z0-9_]{0,62}", 63))
+        if "monitoring" in admin:
+            monitoring = admin["monitoring"]
+            object_fields(monitoring, {"extension", "digest"})
+            require(monitoring["extension"] == "pg_stat_statements")
+            require(matches(monitoring["digest"], r"sha256:[a-f0-9]{64}", 71))
         for name in ("uid", "gid"):
             require(type(admin[name]) is int and 1 <= admin[name] <= 2147483647)
         require(admin["socket_directory"] == "/var/run/postgresql")

@@ -1,245 +1,83 @@
 # 개발 계획
 
-Status: M1·M2·M3 로컬 구현 / 기존 voc-db 전환 검증 진행 / M4·운영 M5 미구현
+Status: 0.4.0 MVP 단순화 / 기존 DB 전환과 Query Man consumer 갱신 미완료
 
-Python + uv package·오프라인 계약, 로컬 Docker 검증과 M3 발급·적용·전달·복구를 구현했다.
-같은 CA의 로컬 credential rotation도 지원한다. 구현 계약은 [Tool contract](tool-contract.md),
-[로컬 executor](local-executor.md), [로컬 lifecycle](local-lifecycle.md)에 있으며 운영 backend는 후속 설계다.
-실제 작업 경계는 [운영 설계](operations.md)가 소유한다.
-문서를 작성했다는 이유로 외부 DB나 Kubernetes 실행이 승인되지는 않는다.
+## 현재 범위
 
-## 구현 순서
+| 단계 | 구현한 기능 |
+|---|---|
+| M1 | Python/uv CLI, capabilities·inspect·plan, JSON 검증·비밀 비노출·source 0개 |
+| M2 | 로컬 Docker에서 TLS·인증서·대상·읽기 전용 접속 검사 |
+| M3 MVP | prepare·issue·apply·deliver, 같은 CA의 rotate, 마지막 기록 status |
 
-| 단계 | 목표 | 구현할 산출물 | 완료 기준 |
-|---|---|---|---|
-| M1 (완료) | 오프라인 계획을 스킬이 읽을 수 있게 만들기 | 단일 CLI/package, 요청 검증, version/capabilities, `plan` JSON, 사용 예시 | DB·Docker·PKI·Secret 접근 없이 정상/오류 결과를 예측 가능하게 반환 |
-| M2 (완료) | 승인된 대상의 실제 연결 검증 | Docker 대상 확인, profile별 credential 전달 검증, live `verify`, 스킬의 최소 연계 | 정확한 대상에서 긍정/부정 접속 검사와 스킬 결과 해석이 재현됨 |
-| M3 (로컬 구현) | 로컬 테스트 환경의 인증 준비 자동화 | 테스트 PKI 발급, 제한된 DB 인증 적용, 외부 상태 관리, 실패·재개·복구, DBA 스킬의 해당 호출 | 새 disposable DB에서 준비→검증→실패복구를 수행하고 기존 설정을 보존 |
-| M4 | Pod에 credential을 공급하기 | 선택한 Secret provider 경로, manifest template, Pod UID/권한·DNS 검증, 별도 검증 Job | Pod 재생성·다른 node 배치 후에도 승인된 서비스 identity로 접속 |
-| M5 | 갱신과 운영 인계 마무리 | rotation/폐기/복구 흐름, 만료 관리, consumer 호환 테스트, 운영 PKI·기록 체계 연계 | 새 인증서 전환과 장애 복구, 기록 보존, 전체 스킬 호출 계약을 환경별로 검증 |
+0.3.0의 rollback 명령, DB·credential 복원, 실패 시 보상 DB 변경, unknown/partial_failure
+상태 처리와 오류 재분류를 제거했다. 접속할 때 고의 timeout·cancel을 발생시키고 복구하던 진단도 제거했다.
+실제 연결 검사, 입력·대상·파일 권한 검사, 실행 timeout과 임시 실행 자원 정리는 유지한다.
 
-M2부터 스킬 연계를 작게 검증한다. 모든 Kubernetes 기능이 생길 때까지 실제 consumer 연계를
-미루지 않는다. 새 쓰기 기능은 해당 단계의 계약과 실행 검증이 갖춰진 뒤 스킬에 노출한다.
+## 코드 책임
 
-## 바로 이어서 할 첫 작업
+| 구분 | 코드 |
+|---|---|
+| 입력·JSON 경계 | `cli.py`, `contract.py`, `lifecycle_contract.py` |
+| 기본 인증서 흐름 | `local_lifecycle.py`, `local_pki.py`, `credential_delivery.py` |
+| DB 인증 설정·접속 검사 | `db_admin.py`, `db_config.py`, `executor.py`, `verify_worker.py`, `policy_verification.py`, `policy_worker.py` |
+| 재실행 동일성·동시 변경 방지 | `operation_store.py`, `lifecycle_binding.py` |
+| 제한된 프로세스 실행 | `process.py` |
+| 테스트 | root `tests/`; 실제 DB fixture는 opt-in |
 
-1. 기존 voc-db의 승인된 관리자 접속 수단을 확인한다. 현재 고정 local postgres socket의 최소 SELECT가 인증 단계에서 거부되어 catalog 검사는 미완료다.
-2. 그 수단에서 제한된 catalog를 확인하고 새 확인 identity·외부 PKI·전달·기록 위치를 고정한다.
-3. 기존 role·server credential·trust·데이터를 보존하는 구체적인 전환 계획을 작성한다. 기존 권한 충돌은 자동 revoke로 해결하지 않는다.
-4. 기존 helper·credential 경로를 참조하지 않는 환경에서 실제 새 연결·재발급·복구와 스킬 호출을 검증한다.
-5. 새 연결 사용 전환과 이전 신뢰·복구·백업 보존 조건을 확인한 뒤 로컬 도구 사용을 전환한다.
+실패 전용 복구 엔진은 없다. 오류는 JSON 경계에서 정규화하며 알려진 코드의 의미를 보존한다.
+부분 파일의 자동 수선은 MVP 밖이다. 재실행은 같은 작업 ID로 하며 대상·파일 충돌은 오류다.
 
-기존 DB/credential/백업/기록은 보존한다. M1 계획은 여전히 executable false이며 live snapshot이나
-실행 승인 artifact로 재사용하지 않는다. M2 검사 성공도 기존 도구·credential 폐기 근거가 아니다.
+## 검증
 
-## 단계별 상세 범위
-
-### M1: 오프라인 계약
-
-- 일반 hostname/port/database/profile 값과 환경·작업 scope를 구분한다. Profile ID와 PostgreSQL
-  database 이름을 같은 것으로 취급하거나 입력 이름을 자동 교정하지 않는다.
-- Query Man database profile v1의 `verify-full`/`client-certificate` 요구와 source v6 참조를
-  보존한다. Passport가 source inventory나 전체 YAML validation의 새 authority가 되지 않는다.
-- 스킬이 기존 Query Man 검증을 수행한 뒤 선택한 profile의 비밀 없는 입력을 전달하도록 한다.
-  원본 revision/digest 결합이 필요한 쓰기 단계에는 다시 확인할 수 있는 artifact 참조를 붙인다.
-- DB만 준비하는 입력에서 source 0개는 정상이다. DB/인증/배포 관측은 `not_checked`로 명시한다.
-- Secret-store 식별자나 인증정보가 agent 입출력에 필요하지 않게 executor alias와 내부 binding을
-  분리한다. 대상/명령 allowlist 검사를 두고 임의 shell·SQL 실행 기능은 제공하지 않는다.
-- 요청/출력 크기, timeout, exit/result 계약과 known-error 분류를 정한다. 사람 설명과 JSON 결과가
-  서로 다른 사실을 주장하지 않도록 한다.
-
-M1 테스트는 정상 최소 요청, 필수값 누락, 잘못된 이름/port/version, 금지된 secret 필드, source 0개,
-지원하지 않는 capability, 오프라인 경로의 network/credential 미접근과 결과 redaction을 포함한다.
-입력 값을 그대로 오류에 반사해서 비밀이 노출되지 않는지 검증한다.
-
-### M2: 읽기 전용 검사와 첫 스킬 연계
-
-- 승인된 executor가 정확한 DB를 조사하고 host/port만으로 다른 환경을 대체하지 않도록 한다.
-- `inspect`와 `plan`은 오프라인으로 유지한다. live 대상 조사와 인증서 metadata 검사는
-  승인된 `verify` 경로에서 수행한다.
-- Query Man과 같은 UID/GID, 파일 layout, read-only mount와 실제 DB driver 조건에서 검증한다.
-- 정상 TLS/계정/DB/읽기 전용 transaction, 잘못된 서버 CA/hostname/client CA/DN/key, 인증서
-  없음·만료·평문 거부, timeout/cancel/rollback 뒤 연결 복구를 확인한다.
-- 부정 검사는 승인된 테스트 자격 증명과 범위에서만 수행한다. 정상 운영 계정의 동시 연결을
-  고갈시키거나 업무 SQL/데이터를 읽는 방식으로 검사하지 않는다.
-- 기존 source reader가 명시되었을 때만 reader별 권한·budget 검사 범위를 선택한다. 확인용
-  계정의 성공에 source 검증 성공을 덧붙이지 않는다.
-- Admin 스킬에는 offline `inspect`/`plan`, DBA onboarding 스킬에는 승인된 live `verify`를
-  연결한다. 각 스킬이 tool version/capability를 확인하고 정제된 결과만 해석하도록 한다.
-  Admin의 DB 직접 접속 금지를 CLI로 우회하거나 스킬이 private key를 열고 임의 psql 명령을
-  조립하는 경로를 만들지 않는다.
-
-Query Man 쪽 스킬 파일을 실제 변경할 때는 그 저장소에서 skill 개발 지침을 따르고, plan/execute
-권한 경계를 보존하는지 함께 검증한다. 여기에 적은 목표만으로 현재 스킬을 변경했다고 간주하지 않는다.
-
-### M3: 로컬 환경의 제한된 쓰기
-
-- 먼저 **새 disposable fixture**에서 검증한다. 기존 voc-db는 회귀 대상 후보이며 자동 초기화
-  대상이 아니다. Query Cave의 현재 lifecycle과 데이터를 임의로 바꾸지 않는다.
-- 로컬 테스트 issuer와 운영 PKI의 경계를 구분한다. 테스트 키/인증서도 Git 밖에서 생성한다.
-- 기존 승인된 reader 또는 명시적으로 요청한 제한된 확인 계정만 대상으로 한다. 업무 source,
-  view, role 권한 정책을 추측하여 생성하지 않는다.
-- plan에 대상 identity, 전후 변경, 기대 상태, 실행자, snapshot digest, 복구·stop 조건을 담는다.
-- 이미 만족한 상태의 재실행, 계획 이후 drift, 동시 작업, 인증 실패, 일부 단계 실패와 도구
-  종료 후 재개를 다룬다. 입력 hash가 같다는 이유만으로 현재 DB가 맞다고 판단하지 않는다.
-- CA trust/HBA/ident를 적용 전에 검증하고 신규 계정의 로그인 허용 순서를 지킨다. reload 후
-  실제 적용과 인증을 확인한다. 허용 범위를 넓혀 실패를 해결하지 않는다.
-- rollback은 이번 작업이 소유한 변경만 대상으로 한다. 기존 role/DB 삭제나 나중에 바뀐 설정의
-  전체 덮어쓰기를 자동 수행하지 않는다.
-
-M3 완료는 “한 번 성공”이 아니라 실패 지점별로 기존 서비스·설정을 보존하거나 정확한 복구 필요
-상태를 반환하는 것이다. 실행 사실과 복구 실패는 숨기지 않는다.
-
-### M4: Kubernetes 전달
-
-- 실제 사용할 cluster/context, namespace, workload와 Secret provider를 먼저 고정한다.
-  해당 환경은 현재 조사·설정되지 않았다.
-- 최소 한 경로를 end-to-end로 구현한다. Kubernetes Secret과 외부 Secret store 연동을 모두
-  지원하기 위한 범용 provider framework를 먼저 만들지 않는다.
-- repo에는 실제 Secret 값 없이 참조·mount·권한 template만 둔다. 앱에는 필요한 세 파일만
-  전달하고 PKI authority와 운영 백업을 mount하지 않는다.
-- Pod 재생성/재배치, app UID 읽기, 권한 없는 UID 접근 차단, 서버 DNS/SAN, DB egress 허용과
-  인증서 mismatch를 검증한다. Node identity를 DB client identity로 사용하지 않는다.
-- credential 전달 완료와 rollout/application acceptance를 별도 결과로 반환한다.
-
-### M5: 갱신과 운영 인계
-
-- 새 인증서 준비→신뢰 확인→새 instance 검증→전환→이전 인증서 정리 순서를 구현한다.
-- 파일 갱신과 실제 connection pool 교체를 함께 확인한다. 같은 CA로 새 인증서를 발급해도
-  이전 인증서가 자동 폐기되는 것은 아니다.
-- 만료·폐기·키 유출 대응과 보통의 실패 rollback을 구분한다. CA trust 제거의 다른 사용자
-  영향과 승인된 CRL/폐기 수단을 확인한다.
-- protected 기록 시스템과 승인 수단을 실제 조직 환경에 연결한다. 예시 JSON이나 local file의
-  `approved` 값으로 권한을 대신하지 않는다.
-- tool/skill 호환성, output redaction, 제한된 실행 권한과 운영 문서를 같은 배포 단위로 검증한다.
-- production 최초 활성화는 Query Man의 source·HTTP 인증·traffic-off acceptance 절차를 별도로
-  따른다. Passport의 DB 검증 결과 하나로 launch 완료를 보고하지 않는다.
-
-## 검증 책임과 완료 보고
-
-M1 최소 환경은 Linux/POSIX, Python 3.12+, uv이며 현재 Python 3.12.3에서 검증했다.
-M1 구현 당시 런타임은 표준 라이브러리만 사용했다. M3 내부 발급 모듈부터 `cryptography`를
-런타임 의존성으로 추가했으며 `uv.lock`으로 실행·개발 의존성을 고정한다.
+Linux/POSIX, Python 3.12+, uv가 기본 환경이다. 실제 연결 검사는 로컬 Docker와
+미리 준비된 PostgreSQL 18 및 Query Man runtime image가 필요하다.
 
 ```bash
 uv sync --locked
-uv run --locked pytest -q
 uv run --locked ruff check .
 uv run --locked ruff format --check .
 uv run --locked mypy
+uv run --locked pytest -q
 uv build
+QUERY_PASSPORT_DOCKER_TESTS=1 uv run --locked pytest -q --tb=short
 ```
 
-2026-09-05 검증 결과: `pytest` 151개 통과, Ruff lint/format 검사 통과,
-Mypy 소스 4개 파일 통과, wheel/sdist 빌드 통과. 별도 임시 virtualenv에 wheel을 설치해
-`capabilities`·`inspect`·`plan` 진입점을 확인했다. 문서 JSON 예시와 실제 응답 일치,
-workspace 문서 링크 24개를 확인했다. 기존 외부 저장소 참조 6개는 접근하지 않았다.
-산출물 버전은 0.1.0이며 이 M1 검증 당시에는 Git 미초기화 상태라 commit revision이 없었다.
+2026-09-05 검증 결과:
 
-M1 사용 점검 후 workspace 경로 전체의 symlink 거절과 닫힌 stdout의 traceback 비노출을
-보완했다. 실제 FD 1 폐쇄, 중간/trailing-slash symlink와 경로 교체 회귀를 포함해
-169개 테스트, lint·format·타입 검사와 빌드를 통과했다. 기존 외부 점검 기록은 보존했다.
+- 기본 전체 테스트: **1,066 passed, 41 skipped** (45.77초). Skip은 opt-in 실제 DB 검사다.
+- 실제 DB 전체 실행에서 삭제한 `reconnect` 필드 참조가 드러나 수정했다.
+  영향받은 관리자 identity·설치 wheel·M2 연결·M3 흐름 4개 파일을 재실행해 **32 passed** (208.47초)를 확인했다.
+- 나머지 실제 DB 9개(새 M3 fixture 1개, monitoring 8개)는 앞선 전체 실행에서 통과했다.
+  전체 실행 1회가 모두 통과한 결과로 합산해서 보고하지 않는다.
+- 원래 오류 보존·임시 실행 자원 정리 관련 검사: **157 passed**.
+- Ruff lint/format, mypy(17개 source 파일), wheel/sdist 빌드 통과.
+- 실제 CLI capabilities와 source 0개 offline plan 확인: rollback 미지원, executable false,
+  DB·인증서·인증·application readiness not_checked.
+- 문서의 로컬 링크·내부 anchor와 JSON 예시 일치 확인.
 
-테스트는 root `tests/`에 있으며 schema·필수값·이름·port·version·금지 필드·source 0개,
-미지원 명령/capability, JSON 크기·중첩·중복 key·UTF-8, symlink/hardlink/FIFO·workspace 경계,
-입력값·예외 비노출, 네트워크·credential 미접근, stdin timeout과 출력 제한을 검증한다.
-전체 Query Man YAML/source validator는 실행하지 않는다. 실제 인증서 거부·target drift는 아래 M2 기록으로 별도 검증했다. 일부 적용 실패·설정 복구의
-전체 lifecycle은 아래 별도의 M3 결과로 검증하며 M1/M2 통과로 대신하지 않는다. CI는 미구현이다.
-M2부터 bounded integration, M3부터 failure/recovery, M4부터 container/Pod 검증을 추가한다.
+이번 단순화에서 기존 DB·호스트 credential·Query Man 저장소는 변경하지 않았다.
+삭제한 0.3.0 consumer E2E는 0.4.0 호환성 검증을 대신하지 않으며 consumer 갱신은 아래 후속 작업이다.
 
-구현 결과는 지원 capability, 아직 없는 기능, exact code/artifact revision, 수행한 검사와 실제 외부
-실행 범위를 함께 보고한다. repository test 결과와 protected 운영 증빙은 각각의 저장소에서 관리한다.
+## 2026-09-06 E2E 검증
 
-## 실제 필요 시 결정할 항목
+설치 CLI→새 disposable PostgreSQL의 E2E·통합 테스트를 한 번의 실행에서
+**41 passed, 0 failed, 0 error, 0 skipped**로 확인했다(277.36초).
+발급·적용·전달·접속·갱신, 인증 거부, drift와 오류 후 재실행을 포함한다.
+Query Man consumer 연계는 이번 검증에 포함하지 않았다.
 
-| 항목 | 결정 시점 |
-|---|---|
-| CLI 설치·배포 형식과 지원 Python version | M1 확정: Python 3.12+, uv, wheel/sdist, Linux/POSIX |
-| 승인된 DB/PKI executor와 alias binding | 해당 외부 접근 기능을 시작하기 전 |
-| Secret provider, namespace/workload와 app UID 정책 | M4 시작 전 |
-| 발급기관, 인증서 수명·갱신 시점·폐기 방식 | 운영 PKI를 연결하기 전 |
-| PgBouncer TLS 종단·pool mode, replica read-routing/failover | 별도 환경 요구가 들어온 뒤 |
-| MCP transport 또는 상시 HTTP service | CLI로 충족되지 않는 실제 consumer 요구가 생긴 뒤 |
+첫 시도는 기록 실행기의 umask 상속과 fixture hook 판별 오류로 실패했다.
+제품 코드 변경 없이 기록 실행기만 수정한 뒤 위 전체 테스트를 재실행했다.
+실패 시도와 최종 결과를 모두 보존했다.
 
-미정인 운영 환경 항목은 M1 개발을 막지 않는다. 뒤 단계의 미정 입력을 로컬 값으로 채워 운영 지원을
-주장하지 않는다.
+Git bundle, 미커밋 코드 스냅샷, 실제 테스트 wheel, JSON 실행 이력·JUnit·로그·체크섬과
+복원 안내를 저장소 밖의 전용 폴더에 보존했다. Git clone 및 코드 스냅샷 추출 복원을 검증했고,
+wheel의 Python source 17개가 스냅샷과 일치함을 확인했다. 기존 DB·호스트 인증서는 변경하지 않았다.
 
-## M2 로컬 검증 기록
+## 바로 이어서 할 첫 작업
 
-0.2.0의 M2 관련 unit/process 검사 335개, lint·format·mypy를 통과했다.
-새 PostgreSQL 18 fixture에서 정상 TLS·인증서 거부·source 0개·timeout/cancel/rollback/reconnect와
-대상 drift를 실제로 검증했으며 설치된 wheel의 subprocess 성공/거부 경로를 포함한
-integration 23개를 통과했다.
-정확한 실행 명령은 [로컬 executor 검증](local-executor.md#disposable-검증)에 있다.
-기존 voc-db나 기존 인증서에는 접근·변경하지 않았고 아직 사용 전환 완료를 주장하지 않는다.
+1. Query Man consumer를 0.4.0의 v2 live capability와 오류 계약에 맞춘다. 현재 외부 저장소는 변경하지 않는다.
+2. 기존 DB 전환 필요 시 새 경로·대상을 고정하고 별도 검증한다. 현재 전환은 중단 상태다.
 
-## M3 진행 기록
-
-HBA/ident의 소유 block만 생성·비교·복구하는 순수 helper를 구현하고 125개 테스트로 검증했다.
-기존 block 교체에는 원문 digest 일치가 필요하며, 복구는 다른 작업의 변경을 보존한다.
-이 helper만으로 DB 파일 쓰기·reload·NOLOGIN·PKI 발급·전달·실패복구를 완료했다고 판단하지 않는다.
-이는 초기 순수 helper 검증 기록이며 이후 전체 lifecycle 검증은 아래 기록을 따른다.
-
-M2 완료 provenance: Passport `4d5d8db`, Query Man consumer `8d7e93b`. Passport unit/process 및
-실제 Docker integration을 한 번에 실행해 358개 통과. Query Man 전체 gate는 Ruff·Mypy 및
-pytest 575개 통과(11 deselected). Admin의 실제 offline plan과 DBA helper → Passport → 새 DB의
-실제 TLS/인증/cancel/rollback/reconnect 성공을 확인했다. 기존 application readiness는 not_checked다.
-
-로컬 테스트 issuer는 CA와 발급 세대를 분리하고 기존 파일을 덮어쓰지 않는다. 같은 요청의 재사용,
-불완전 발급 보존, 권한·symlink·Git 경계, 실제 인증서와 키 검증을 61개 테스트로 확인했다.
-외부 상태 저장소는 operation/target lock, 배타적 artifact 생성, append+fsync 기록과 부분 쓰기
-보존을 25개 테스트로 확인했다. 이 로컬 기록은 protected immutable evidence가 아니다.
-Docker/issuer의 private stdin은 1 MiB로 제한하고 입출력을 동시에 처리해 쓰기 중 timeout도
-강제한다. 관련 process·binding·PKI·state 검사 126개와 Ruff·Mypy를 통과했다.
-아직 내부 모듈 검증이며, 공개 쓰기 명령이나 DB 적용·전달·복구 E2E 완료를 뜻하지 않는다.
-
-M3 내부 coordinator는 계획·대상·승인 범위를 묶고 단계별 journal로 발급·DB 적용·전달·복구를
-연결한다. 별도 apply receipt의 CA bundle digest를 이후 검증에도 사용한다. 전달은 새 버전의
-실제 UID 10001/TLS/인증과 인증서 없음·평문 거부 검사를 통과한 뒤에만 active pointer를 바꾼다.
-설정 교체는 실제 이전 inode를 보존하고 배타적으로 새 파일을 게시하며, 복구는 소유한 구간만
-제거한다. 상세 범위와 재현 명령은 [로컬 lifecycle](local-lifecycle.md)에 있다.
-이 내부 backend 검증 시점에는 공개 쓰기 CLI·rotation·기존 voc-db 사용 전환이 미완료였다.
-
-2026-09-05 M3 내부 통합 gate: `QUERY_PASSPORT_DOCKER_TESTS=1 uv run --locked pytest -q --tb=short`
-**841개 통과**(217.56초). Unit/process 809개와 실제 Docker 검사 32개(M2 23개, M3 fixture 1개,
-M3 lifecycle 8개)를 함께 실행했다. 정상 발급→적용→전달→검증→복구, 중복 실행, 응답 유실 후
-재개, 전달 전 검증 실패, PUBLIC 업무 권한 거절, 후속 HBA 변경 보존, CA 내용 drift, 실제로
-로드된 trust 규칙과 디스크 규칙이 다른 경우의 거부를 확인했다. 기존 fixture identity는
-적용·복구 전후의 별도 실제 연결로 보존을 확인했다.
-Ruff lint/format, Mypy 소스 16개 파일, wheel/sdist 빌드와 내부 문서 링크 33개도 통과했다.
-Wheel에 필요한 내부 모듈과 cryptography 의존성이 포함되고 credential artifact가 없음을 확인했다.
-이 결과는 내부 API와 새 disposable 대상의 검증이며, 공개 쓰기 CLI/설치 패키지의 M3 실행 및
-실제 voc-db 사용 전환을 완료했다는 뜻이 아니다. 기존 voc-db·기존 인증서·호스트 백업은 보존했다.
-
-
-### 0.3.0 공개 로컬 CLI와 교체
-
-`prepare`·`issue`·`apply`·`deliver`·`rotate`·`rollback`·`status`의 닫힌 JSON 입력과 정제된 결과를
-구현했다. Opaque operation 참조는 실행 권한을 대신하지 않으며 실패 결과는 실제 phase를 추측하지
-않는다. 같은 CA·identity의 새 세대는 실제 신규 연결 검증 후 전환하고, 이전 credential 복구는
-직전 세대를 다시 검증한 뒤에만 수행한다. 자식 rotation이 활성인 동안 원본 DB rollback은 거절한다.
-
-공개 실행 기록은 새 고정 namespace `~/.local/state/query-passport-executor/operations`를 사용한다.
-기존 `query-passport` 인계·리뷰 디렉터리의 권한·내용을 변경하거나 이전 기록을 자동 이전하지 않는다.
-Timeout·중단은 cleanup 실패에도 보존하여 확정되지 않은 실행을 `unknown`으로 기록한다.
-
-별도 wheel·잠금 파일 기반 runtime 의존성·독립 virtualenv의 exact CLI E2E 1개가 통과했다(55.83초).
-실제 발급·DB 적용·전달·접속·교체·자식 보호·credential 복구·DB 설정 복구·재호출·상태 조회를
-확인했고, 새 fingerprint와 정확한 이전 revision 복구 및 양쪽 발급 세대 보존을 확인했다.
-Query Man consumer는 0.3.0과 실제 lifecycle 오류 응답의 null scope·복구 참조를 검증한다.
-기존 voc-db·기존 인증서·CA·호스트 백업은 이 disposable 검증의 대상으로 사용하지 않았다.
-0.3.0 전체 Passport gate는 `QUERY_PASSPORT_DOCKER_TESTS=1 uv run --locked pytest -q --tb=short`
-**1080개 통과**(298.00초), Ruff lint/format·Mypy 소스 17개 파일·wheel/sdist 빌드 통과다.
-내부 문서 링크 41개와 갱신한 실제 plan JSON을 확인했다. 이어서 실제 Query Man DBA helper →
-설치 wheel → 새 DB의 별도 E2E 1개가 통과했다(60.48초). 이 경로에서도 발급·적용·전달·검증·
-교체·복구와 TARGET_DRIFT의 오류 코드·미확정 결과·operation 참조 보존을 확인했다.
-Query Man 전체 gate는 **732개 통과, 11 deselected**, Ruff·Mypy 소스 25개 파일 통과다.
-검증은 각 저장소의 현재 0.3.0 변경에 대응하며 commit 식별자는 coordinating Git 기록을 따른다.
-
-
-현재 voc-db의 선택적 Docker metadata와 공개 profile을 대조했다. `psql --version`은 성공했지만
-고정 local postgres socket의 최소 `SELECT 1`과 session prefix를 포함한 동일 검사는 모두
-인증 단계에서 거부되었다. 현재 DB catalog·PUBLIC 실효 권한·TLS 설정 검증은 미완료다.
-이 조사에서는 기존 credential·CA·설정·DB를 변경하지 않았으며 새 관리자 인증 수단을 추측하지 않았다.
-0.3.0의 disposable 성공은 기존 voc-db 도구 사용 전환 완료를 뜻하지 않는다.
-Query Man 0.3.0 consumer 구현 commit은 `d0b4581`이다.
+Kubernetes, 운영 PKI, 폐기, 자동 갱신 스케줄러와 장애 복구 자동화는 MVP 범위에서 제외한다.
+기존 voc-db·호스트 credential·백업·기록을 이 작업에서 변경하거나 이관하지 않는다.

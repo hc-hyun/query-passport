@@ -90,7 +90,6 @@ def test_initial_delivery_publishes_only_three_files_and_safe_revision(
         set(path.name for path in candidate(material, "first").iterdir()) == delivery.BUNDLE_FILES
     )
     assert set(path.name for path in candidate(material, "first").parent.iterdir()) == {
-        "intent.json",
         "receipt.json",
         "bundle",
     }
@@ -403,135 +402,7 @@ def test_partial_copy_preserves_old_active_and_can_be_aborted(
             source_bundle=material["second_source"],
             expected_revision=revision(first),
         )
-    result = delivery.rollback(material["destination"], "second", revision(first))
-    assert revision(result) == revision(first)
     assert snapshot(candidate(material, "second")) == staged
-    again = delivery.rollback(material["destination"], "second", revision(first))
-    assert again["reused"] is True
-
-
-def test_rollback_restores_previous_version_and_keeps_both(material: dict[str, Any]) -> None:
-    first = issue(material)
-    second = issue(
-        material,
-        "second",
-        source_bundle=material["second_source"],
-        expected_revision=revision(first),
-    )
-    before = snapshot(material["destination"] / "versions")
-    result = delivery.rollback(material["destination"], "second", second["previous"])
-    assert revision(result) == revision(first)
-    assert active_file(material) == revision(first)
-    assert snapshot(material["destination"] / "versions") == before
-    assert (
-        delivery.rollback(material["destination"], "second", second["previous"])["reused"] is True
-    )
-    with pytest.raises(delivery.DeliveryError, match="^DELIVERY_ROLLED_BACK$"):
-        issue(
-            material,
-            "second",
-            source_bundle=material["second_source"],
-            expected_revision=revision(first),
-        )
-
-
-def test_initial_rollback_deactivates_without_deleting_credentials(
-    material: dict[str, Any],
-) -> None:
-    first = issue(material)
-    before = snapshot(candidate(material, "first"))
-    result = delivery.rollback(material["destination"], "first", first["previous"])
-    assert revision(result) == delivery._empty()
-    assert delivery.inspect_delivery(material["destination"]) == delivery._empty()
-    assert snapshot(candidate(material, "first")) == before
-
-
-def test_wrong_rollback_predecessor_is_rejected(material: dict[str, Any]) -> None:
-    first = issue(material)
-    issue(
-        material,
-        "second",
-        source_bundle=material["second_source"],
-        expected_revision=revision(first),
-    )
-    before = snapshot(material["destination"])
-    with pytest.raises(delivery.DeliveryError, match="^DELIVERY_INPUT_CONFLICT$"):
-        delivery.rollback(material["destination"], "second", None)
-    assert snapshot(material["destination"]) == before
-
-
-def test_old_rollback_cannot_replace_newer_active_generation(material: dict[str, Any]) -> None:
-    first = issue(material)
-    issue(
-        material,
-        "second",
-        source_bundle=material["second_source"],
-        expected_revision=revision(first),
-    )
-    before = snapshot(material["destination"])
-    with pytest.raises(delivery.DeliveryError, match="^DELIVERY_DRIFT$"):
-        delivery.rollback(material["destination"], "first", first["previous"])
-    assert snapshot(material["destination"]) == before
-
-
-def test_rollback_refuses_changed_preserved_previous_files(material: dict[str, Any]) -> None:
-    first = issue(material)
-    second = issue(
-        material,
-        "second",
-        source_bundle=material["second_source"],
-        expected_revision=revision(first),
-    )
-    with (candidate(material, "first") / "client.key").open("ab") as stream:
-        stream.write(b"changed")
-    with pytest.raises(delivery.DeliveryError, match="^DELIVERY_DRIFT$"):
-        delivery.rollback(material["destination"], "second", revision(first))
-    assert active_file(material) == revision(second)
-
-
-def test_rollback_after_failed_validation_records_noop_and_keeps_candidate(
-    material: dict[str, Any],
-) -> None:
-    first = issue(material)
-    with pytest.raises(delivery.DeliveryError):
-        issue(
-            material,
-            "second",
-            source_bundle=material["second_source"],
-            expected_revision=revision(first),
-            validator=lambda _: (_ for _ in ()).throw(RuntimeError("secret-canary")),
-        )
-    before = snapshot(candidate(material, "second"))
-    result = delivery.rollback(material["destination"], "second", revision(first))
-    assert revision(result) == revision(first)
-    assert snapshot(candidate(material, "second")) == before
-    assert active_file(material) == revision(first)
-
-
-def test_interrupted_rollback_reuses_receipt_without_touching_credential_versions(
-    material: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    first = issue(material)
-    second = issue(
-        material,
-        "second",
-        source_bundle=material["second_source"],
-        expected_revision=revision(first),
-    )
-    before = snapshot(material["destination"] / "versions")
-    with monkeypatch.context() as interrupted:
-        interrupted.setattr(
-            delivery, "_publish", lambda *_: (_ for _ in ()).throw(OSError("secret-canary"))
-        )
-        with pytest.raises(delivery.DeliveryError):
-            delivery.rollback(material["destination"], "second", revision(first))
-    assert active_file(material) == revision(second)
-    receipt = snapshot(material["destination"] / "rollbacks")
-    result = delivery.rollback(material["destination"], "second", revision(first))
-    assert result["reused"] is True
-    assert active_file(material) == revision(first)
-    assert snapshot(material["destination"] / "versions") == before
-    assert snapshot(material["destination"] / "rollbacks") == receipt
 
 
 def test_store_lock_rejects_competing_transition(material: dict[str, Any]) -> None:

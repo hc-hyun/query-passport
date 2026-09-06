@@ -62,7 +62,7 @@ def _uncertain(error: BaseException | None) -> bool:
 
 
 def cleanup_container(name: str, *, prior_error: BaseException | None = None) -> None:
-    """Reconcile one fresh owned container without replacing an uncertain outcome.
+    """Remove one fresh owned container without replacing the original failure.
 
     The caller retains and rethrows its original exception. A timeout or interrupt
     first encountered during cleanup also remains uncertain, even if a later
@@ -81,18 +81,18 @@ def cleanup_container(name: str, *, prior_error: BaseException | None = None) ->
                 timeout=5,
             )
             if remaining.strip():
-                cleanup_error = ContractError("RECOVERY_REQUIRED")
+                cleanup_error = ContractError("EXECUTOR_CLEANUP_FAILED")
         except BaseException as observation_error:  # noqa: BLE001 - bounded cleanup classification
             cleanup_error = (
                 observation_error
                 if _uncertain(observation_error)
-                else ContractError("RECOVERY_REQUIRED")
+                else ContractError("EXECUTOR_CLEANUP_FAILED")
             )
         if _uncertain(removal_error):
             cleanup_error = removal_error
         elif not isinstance(removal_error, ContractError):
-            cleanup_error = cleanup_error or ContractError("RECOVERY_REQUIRED")
-    if cleanup_error is not None and not _uncertain(prior_error):
+            cleanup_error = cleanup_error or ContractError("EXECUTOR_CLEANUP_FAILED")
+    if cleanup_error is not None and prior_error is None:
         raise cleanup_error
 
 
@@ -431,7 +431,7 @@ def verify_request(request: dict[str, Any]) -> dict[str, Any]:
         except credential_delivery.DeliveryError as error:
             raise ContractError("CREDENTIAL_ACCESS_DENIED") from error
         except operation_store.StateError as error:
-            raise ContractError("RECOVERY_REQUIRED") from error
+            raise ContractError(error.code) from error
     else:
         worker = run_verification(binding, request)
     result = respond("inspect", request)["result"]
@@ -445,7 +445,7 @@ def verify_request(request: dict[str, Any]) -> dict[str, Any]:
         }
     )
     result["target_identity"] = checks["target"]
-    result["db_connectivity"] = checks["reconnect"]
+    result["db_connectivity"] = checks["read_only_transaction"]
     result["authentication"] = checks["client_identity"]
     result["certificate_validation"] = (
         "passed" if checks["tls"] == checks["client_identity"] == "passed" else "not_checked"

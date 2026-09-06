@@ -30,11 +30,6 @@ CHECK_NAMES = (
     "client_identity",
     "target",
     "read_only_transaction",
-    "statement_timeout",
-    "timeout_recovery",
-    "cancellation",
-    "cancellation_recovery",
-    "reconnect",
 )
 ERROR_CODES = frozenset(
     {
@@ -385,86 +380,20 @@ async def _transaction_check(connection: Any) -> None:
         raise WorkerFailure("VERIFICATION_FAILED", "read_only_transaction")
 
 
-def _expected_cancel(error: BaseException, reason: str) -> bool:
-    return (
-        getattr(error, "sqlstate", None) == "57014"
-        and getattr(getattr(error, "diag", None), "message_primary", None) == reason
-    )
-
-
-async def _timeout_check(connection: Any, checks: dict[str, CheckState]) -> None:
-    # set_config changes only this read-only transaction's time limit.
-    await _row(connection, "SELECT pg_catalog.set_config('statement_timeout', '100', true)")
-    try:
-        await _row(connection, "SELECT pg_catalog.pg_sleep(0.5)")
-    except Exception as error:
-        if not _expected_cancel(error, "canceling statement due to statement timeout"):
-            raise
-    else:
-        raise WorkerFailure("VERIFICATION_FAILED", "statement_timeout")
-    checks["statement_timeout"] = "passed"
-    await connection.rollback()
-    await _transaction_check(connection)
-    checks["timeout_recovery"] = "passed"
-    await connection.rollback()
-
-
-async def _cancellation_check(connection: Any, checks: dict[str, CheckState]) -> None:
-    await _transaction_check(connection)
-    pending = asyncio.create_task(_row(connection, "SELECT pg_catalog.pg_sleep(1)"))
-    try:
-        # Wait for a query in flight, then give the server time to receive it.
-        # A missed cancellation must fail, never be confused with a timeout.
-        async with asyncio.timeout(0.5):
-            while not pending.done() and connection.pgconn.transaction_status != 1:
-                await asyncio.sleep(0.005)
-        await asyncio.sleep(0.05)
-        if pending.done():
-            await pending
-            raise WorkerFailure("VERIFICATION_FAILED", "cancellation")
-        await connection.cancel_safe(timeout=1.0)
-        try:
-            await pending
-        except Exception as error:
-            if not _expected_cancel(error, "canceling statement due to user request"):
-                raise
-        else:
-            raise WorkerFailure("VERIFICATION_FAILED", "cancellation")
-        checks["cancellation"] = "passed"
-    finally:
-        if not pending.done():
-            pending.cancel()
-        # Always retrieve task errors; asyncio must not print provider diagnostics.
-        with contextlib.suppress(BaseException):
-            await pending
-    await connection.rollback()
-    await _transaction_check(connection)
-    checks["cancellation_recovery"] = "passed"
-    await connection.rollback()
-
-
 async def verify(request: Request, paths: dict[str, str], checks: dict[str, CheckState]) -> None:
     driver = importlib.import_module("psycopg")
-    # psycopg 3.2+'s safe async cancellation needs libpq >=17 to avoid its legacy
-    # blocking, potentially plaintext cancellation fallback.
-    if driver.pq.version() < 170000 or not hasattr(driver.AsyncConnection, "cancel_safe"):
-        raise WorkerFailure("VERIFICATION_FAILED", "cancellation")
+    # libpq 17+ supports the required client-certificate options.
+    if driver.pq.version() < 170000:
+        raise WorkerFailure("VERIFICATION_FAILED", "client_identity")
     parameters = connection_parameters(request, paths)
     async with asyncio.timeout(OVERALL_TIMEOUT_SECONDS):
-        for attempt in range(2):
-            connection = await driver.AsyncConnection.connect(**parameters, prepare_threshold=None)
-            try:
-                await connection.set_read_only(True)
-                await connection.set_isolation_level(driver.IsolationLevel.REPEATABLE_READ)
-                await _identity(connection, request, checks)
-                if attempt == 0:
-                    await _timeout_check(connection, checks)
-                    await _cancellation_check(connection, checks)
-                else:
-                    await connection.rollback()
-                    checks["reconnect"] = "passed"
-            finally:
-                await connection.close()
+        connection = await driver.AsyncConnection.connect(**parameters, prepare_threshold=None)
+        try:
+            await connection.set_read_only(True)
+            await connection.set_isolation_level(driver.IsolationLevel.REPEATABLE_READ)
+            await _identity(connection, request, checks)
+        finally:
+            await connection.close()
 
 
 def sanitize_environment() -> None:

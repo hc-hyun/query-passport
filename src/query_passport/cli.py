@@ -131,7 +131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args == ["--help"]:
                 response["result"]["usage"] = (
                     "query-passport capabilities [--format json]; "
-                    "query-passport inspect|plan|verify|prepare|issue|apply|deliver|rotate|rollback|status "
+                    "query-passport inspect|plan|verify|prepare|issue|apply|deliver|rotate|status "
                     "--request FILE|- "
                     "[--workspace DIR] [--format json]"
                 )

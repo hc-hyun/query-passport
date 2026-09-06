@@ -16,15 +16,15 @@ MAX_OUTPUT_BYTES = 16384
 MAX_DEPTH = 8
 TIMEOUT_SECONDS = 5
 LIFECYCLE_TIMEOUT_SECONDS = 180
-POLICY_REVISION = "m3-local-lifecycle-1"
-LIFECYCLE_COMMANDS = ("prepare", "issue", "apply", "deliver", "rotate", "rollback", "status")
+POLICY_REVISION = "mvp-local-lifecycle-2"
+LIFECYCLE_COMMANDS = ("prepare", "issue", "apply", "deliver", "rotate", "status")
 COMMANDS = ("capabilities", "inspect", "plan", "verify", *LIFECYCLE_COMMANDS)
 CAPABILITIES = (
     "profile.inspect.v1",
     "plan.offline.v1",
-    "connection.verify.v1",
-    "lifecycle.local.v1",
-    "credential.rotate.local.v1",
+    "connection.verify.v2",
+    "lifecycle.local.v2",
+    "credential.rotate.local.v2",
 )
 ERRORS = {
     "INVALID_INPUT": (2, "Input does not match the public request contract."),
@@ -46,8 +46,48 @@ ERRORS = {
     "PERMISSION_DENIED": (8, "The bound identity lacks the required diagnostic permissions."),
     "CONNECTION_FAILED": (8, "The bound database connection could not be established."),
     "VERIFICATION_FAILED": (8, "The requested live verification did not pass."),
-    "RECOVERY_REQUIRED": (9, "The operation needs state reconciliation or scoped recovery."),
+    "OPERATION_ORDER_INVALID": (9, "Run the preceding command before this command."),
+    "DB_CONFIG_WRITE_FAILED": (9, "Database configuration publication did not complete."),
+    "EXECUTOR_CLEANUP_FAILED": (9, "The temporary executor container could not be removed."),
+    "STATE_ACCESS_DENIED": (9, "The operation directory could not be accessed."),
+    "STATE_WRITE_FAILED": (9, "The operation record could not be written."),
+    "STATE_INVALID": (9, "The operation record is missing or invalid."),
+    "STATE_CONFLICT": (9, "The operation artifact already exists."),
+    "STATE_PARTIAL": (9, "The operation journal is incomplete."),
+    "OPERATION_BUSY": (9, "Another command holds the target or operation lock."),
+    "DELIVERY_INVALID_INPUT": (9, "The delivery input is invalid."),
+    "DELIVERY_ACCESS_DENIED": (9, "The delivery files could not be accessed."),
+    "DELIVERY_OWNERSHIP_REQUIRED": (9, "The delivery directory has no supported ownership record."),
+    "DELIVERY_INPUT_CONFLICT": (9, "The delivery generation belongs to different input."),
+    "DELIVERY_DRIFT": (9, "The delivery files or active generation changed."),
+    "DELIVERY_PARTIAL_STATE": (9, "The delivery generation is incomplete."),
+    "DELIVERY_PERMISSION_DENIED": (9, "The delivered file permissions are invalid."),
+    "DELIVERY_BUSY": (9, "Another command holds the delivery lock."),
+    "DELIVERY_VALIDATION_FAILED": (9, "The candidate credential did not pass validation."),
+    "PKI_INVALID_INPUT": (9, "The issuer input is invalid."),
+    "PKI_ACCESS_DENIED": (9, "The issuer files could not be accessed."),
+    "PKI_PARTIAL_STATE": (9, "The issuer files are incomplete."),
+    "PKI_INPUT_CONFLICT": (9, "The issuer generation belongs to different input."),
+    "PKI_VALIDATION_FAILED": (9, "The issuer certificate or key did not pass validation."),
+    "PKI_EXPIRED": (9, "The issuer certificate has expired."),
+    "PKI_OPERATION_FAILED": (9, "Certificate issuance failed."),
+    "PKI_TIMEOUT": (9, "Certificate issuance exceeded its time limit."),
 }
+
+
+PKI_ERRORS = frozenset(
+    {
+        "PKI_VALIDATION_FAILED",
+        "PKI_INVALID_INPUT",
+        "PKI_PARTIAL_STATE",
+        "INTERNAL_ERROR",
+        "PKI_TIMEOUT",
+        "PKI_EXPIRED",
+        "PKI_INPUT_CONFLICT",
+        "PKI_ACCESS_DENIED",
+        "PKI_OPERATION_FAILED",
+    }
+)
 
 
 class ContractError(Exception):
@@ -232,7 +272,7 @@ def respond(command: str, request: dict[str, Any] | None = None) -> dict[str, An
                 "differences": "unknown",
                 "actions": [],
                 "desired_state": {"sslmode": "verify-full", "authentication": "client-certificate"},
-                "required_capabilities": ["connection.verify.v1"],
+                "required_capabilities": ["connection.verify.v2"],
                 "next_action": "authorized_read_only_verification",
                 "preconditions": [
                     "query_man_profile_validation",

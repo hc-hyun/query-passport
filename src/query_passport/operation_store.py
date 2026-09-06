@@ -48,10 +48,6 @@ PHASES = frozenset(
         "delivered",
         "verifying",
         "verified",
-        "rolling_back",
-        "rolled_back",
-        "partial_failure",
-        "unknown",
     }
 )
 
